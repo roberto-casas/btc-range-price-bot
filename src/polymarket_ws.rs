@@ -18,34 +18,56 @@ pub struct PriceUpdate {
 // Polymarket CLOB WebSocket endpoint
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
+/// Maximum assets per subscription message to avoid server rejections.
+const MAX_ASSETS_PER_SUB: usize = 50;
+
+/// Interval between keep-alive pings.
+const PING_INTERVAL_SECS: u64 = 15;
+
 // ── Subscription message types ────────────────────────────────────────────────
 
+/// Initial handshake message — opens the market channel.
 #[derive(Serialize)]
-struct SubscribeMsg<'a> {
+struct HandshakeMsg<'a> {
+    assets_ids: Vec<&'a str>,
     #[serde(rename = "type")]
     msg_type: &'a str,
-    markets: Vec<&'a str>,
 }
 
-/// Raw tick from Polymarket WebSocket feed (simplified)
+/// Subscribe/unsubscribe message — adds or removes asset subscriptions
+/// without reconnecting.
+#[derive(Serialize)]
+struct OperationMsg<'a> {
+    assets_ids: Vec<&'a str>,
+    operation: &'a str,
+}
+
+// ── Incoming event types ──────────────────────────────────────────────────────
+
 #[derive(Deserialize, Debug)]
-struct RawTick {
-    #[serde(rename = "asset_id", default)]
+struct WsEvent {
+    event_type: Option<String>,
+    // For last_trade_price events (fields at top level)
     asset_id: Option<String>,
-    #[serde(rename = "price", default)]
     price: Option<serde_json::Value>,
-    #[serde(rename = "side", default)]
+    side: Option<String>,
+    timestamp: Option<serde_json::Value>,
+    // For price_change events (array of changes)
+    price_changes: Option<Vec<PriceChangeEntry>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PriceChangeEntry {
+    asset_id: Option<String>,
+    price: Option<serde_json::Value>,
     side: Option<String>,
 }
 
 /// Start a WebSocket listener that dynamically subscribes to market token IDs
 /// received via a `watch` channel and broadcasts price updates.
 ///
-/// The task runs indefinitely in the background; cancel it by dropping the
-/// `broadcast::Sender` handle.
-///
-/// When new token IDs arrive on `token_rx`, the listener reconnects and
-/// subscribes to the updated list.
+/// When new token IDs arrive on `token_rx`, subscriptions are updated in-place
+/// without reconnecting (using the Polymarket `operation` protocol).
 pub async fn start_ws_listener(
     mut token_rx: watch::Receiver<Vec<String>>,
     tx: broadcast::Sender<PriceUpdate>,
@@ -53,17 +75,17 @@ pub async fn start_ws_listener(
     let url = Url::parse(WS_URL)?;
 
     loop {
-        let token_ids = token_rx.borrow_and_update().clone();
-
-        if token_ids.is_empty() {
-            info!("No tokens to subscribe to yet. Waiting for scanner results...");
-            // Wait until the scanner sends us token IDs
-            if token_rx.changed().await.is_err() {
-                // Sender dropped — shut down
-                info!("Token watch channel closed. Stopping WebSocket listener.");
-                return Ok(());
+        // Wait until we have at least some tokens before connecting
+        {
+            let ids = token_rx.borrow_and_update().clone();
+            if ids.is_empty() {
+                info!("No tokens to subscribe to yet. Waiting for scanner results...");
+                if token_rx.changed().await.is_err() {
+                    info!("Token watch channel closed. Stopping WebSocket listener.");
+                    return Ok(());
+                }
+                continue;
             }
-            continue;
         }
 
         info!("Connecting to Polymarket WebSocket at {WS_URL}...");
@@ -76,21 +98,39 @@ pub async fn start_ws_listener(
             }
         };
 
-        info!("WebSocket connected. Subscribing to {} tokens...", token_ids.len());
         let (mut writer, mut reader) = ws_stream.split();
 
-        // Subscribe to markets
-        let sub = SubscribeMsg {
-            msg_type: "subscribe",
-            markets: token_ids.iter().map(String::as_str).collect(),
+        // 1) Send initial handshake (empty assets_ids, type: "market")
+        let handshake = HandshakeMsg {
+            assets_ids: vec![],
+            msg_type: "market",
         };
-        let sub_json = serde_json::to_string(&sub)?;
-        if let Err(e) = writer.send(Message::Text(sub_json.into())).await {
-            warn!("Failed to send subscription: {e}. Reconnecting...");
+        let handshake_json = serde_json::to_string(&handshake)?;
+        debug!("Sending handshake: {handshake_json}");
+        if let Err(e) = writer.send(Message::Text(handshake_json.into())).await {
+            warn!("Failed to send handshake: {e}. Reconnecting...");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             continue;
         }
 
-        // Process incoming messages until an error occurs or tokens are updated
+        // 2) Subscribe to current tokens via operation messages
+        let current_ids = token_rx.borrow_and_update().clone();
+        if !send_subscribe_batches(&mut writer, &current_ids).await {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            continue;
+        }
+
+        info!(
+            "WebSocket connected. Subscribed to {} tokens.",
+            current_ids.len(),
+        );
+
+        // Set up periodic ping to keep the connection alive
+        let mut ping_interval =
+            tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.tick().await; // consume the immediate first tick
+
+        // Process incoming messages
         loop {
             tokio::select! {
                 msg = reader.next() => {
@@ -117,13 +157,22 @@ pub async fn start_ws_listener(
                         _ => {}
                     }
                 }
+                _ = ping_interval.tick() => {
+                    if let Err(e) = writer.send(Message::Ping(vec![].into())).await {
+                        warn!("Failed to send ping: {e}. Reconnecting...");
+                        break;
+                    }
+                }
                 result = token_rx.changed() => {
                     if result.is_err() {
                         info!("Token watch channel closed. Stopping WebSocket listener.");
                         return Ok(());
                     }
-                    info!("Token list updated. Reconnecting to re-subscribe...");
-                    break;
+                    let new_ids = token_rx.borrow_and_update().clone();
+                    info!("Token list updated ({} tokens). Sending new subscriptions...", new_ids.len());
+                    if !send_subscribe_batches(&mut writer, &new_ids).await {
+                        break; // reconnect on failure
+                    }
                 }
             }
         }
@@ -132,55 +181,127 @@ pub async fn start_ws_listener(
     }
 }
 
-fn process_ws_message(text: &str, tx: &broadcast::Sender<PriceUpdate>) {
-    // The CLOB WS sends arrays of tick objects
-    let ticks: Vec<serde_json::Value> = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => {
-            // May be a single object
-            match serde_json::from_str::<serde_json::Value>(text) {
-                Ok(v) if v.is_object() => vec![v],
-                _ => return,
+/// Send subscription messages in batches using the `operation: "subscribe"` format.
+/// Returns `true` on success.
+async fn send_subscribe_batches(
+    writer: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    token_ids: &[String],
+) -> bool {
+    for chunk in token_ids.chunks(MAX_ASSETS_PER_SUB) {
+        let msg = OperationMsg {
+            assets_ids: chunk.iter().map(String::as_str).collect(),
+            operation: "subscribe",
+        };
+        let json = match serde_json::to_string(&msg) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize subscription: {e}");
+                return false;
             }
+        };
+        debug!("Sending subscribe batch ({} tokens): {json}", chunk.len());
+        if let Err(e) = writer.send(Message::Text(json.into())).await {
+            warn!("Failed to send subscription batch: {e}");
+            return false;
+        }
+    }
+    true
+}
+
+fn process_ws_message(text: &str, tx: &broadcast::Sender<PriceUpdate>) {
+    let event: WsEvent = match serde_json::from_str(text) {
+        Ok(e) => e,
+        Err(_) => {
+            // Try parsing as an array of events
+            if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
+                for val in events {
+                    if let Ok(ev) = serde_json::from_value::<WsEvent>(val) {
+                        process_event(&ev, tx);
+                    }
+                }
+            }
+            return;
         }
     };
+    process_event(&event, tx);
+}
 
-    let now = std::time::SystemTime::now()
+fn process_event(event: &WsEvent, tx: &broadcast::Sender<PriceUpdate>) {
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    for tick in ticks {
-        let raw: RawTick = match serde_json::from_value(tick) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+    match event.event_type.as_deref() {
+        Some("last_trade_price") => {
+            if let Some(update) = extract_update(
+                event.asset_id.as_deref(),
+                &event.price,
+                event.side.as_deref(),
+                event
+                    .timestamp
+                    .as_ref()
+                    .and_then(parse_timestamp_ms)
+                    .unwrap_or(now_ms),
+            ) {
+                let _ = tx.send(update);
+            }
+        }
+        Some("price_change") => {
+            if let Some(ref changes) = event.price_changes {
+                for pc in changes {
+                    if let Some(update) = extract_update(
+                        pc.asset_id.as_deref(),
+                        &pc.price,
+                        pc.side.as_deref(),
+                        now_ms,
+                    ) {
+                        let _ = tx.send(update);
+                    }
+                }
+            }
+        }
+        _ => {
+            // book, tick_size_change, etc. — ignore for price tracking
+        }
+    }
+}
 
-        let token_id = match raw.asset_id {
-            Some(id) if !id.is_empty() => id,
-            _ => continue,
-        };
+fn extract_update(
+    asset_id: Option<&str>,
+    price_val: &Option<serde_json::Value>,
+    side: Option<&str>,
+    timestamp_ms: u64,
+) -> Option<PriceUpdate> {
+    let token_id = asset_id.filter(|id| !id.is_empty())?;
 
-        let price_val = match raw.price {
-            Some(serde_json::Value::Number(n)) => n.as_f64(),
-            Some(serde_json::Value::String(s)) => s.parse::<f64>().ok(),
-            _ => None,
-        };
-        let price = match price_val {
-            Some(p) if (0.001..=0.999).contains(&p) => p,
-            _ => continue,
-        };
+    let price = match price_val {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().ok(),
+        _ => None,
+    }?;
 
-        let side = raw.side.unwrap_or_else(|| "buy".to_string());
+    if !(0.001..=0.999).contains(&price) {
+        return None;
+    }
 
-        let update = PriceUpdate {
-            token_id,
-            price,
-            side,
-            timestamp_ms: now,
-        };
+    Some(PriceUpdate {
+        token_id: token_id.to_string(),
+        price,
+        side: side.unwrap_or("BUY").to_uppercase(),
+        timestamp_ms,
+    })
+}
 
-        // Ignore send errors (no active receivers is fine)
-        let _ = tx.send(update);
+fn parse_timestamp_ms(val: &serde_json::Value) -> Option<u64> {
+    match val {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
     }
 }
