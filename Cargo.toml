@@ -51,5 +51,14 @@ futures-util = "0.3"
 # URL utilities
 url = "2"
 
+# SQLite (persistent dry-run state)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Random number generation (for AI advisor)
+rand = "0.8"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

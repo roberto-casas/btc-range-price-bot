@@ -1,5 +1,8 @@
+use crate::db::{Db, DbOrder};
 use crate::types::SimulatedOrder;
+use chrono::Utc;
 use tracing::info;
+use uuid::Uuid;
 
 /// In dry-run mode: log and return a `SimulatedOrder` without calling any
 /// real exchange API.
@@ -49,6 +52,63 @@ pub fn simulate_pair_entry(
     ]
 }
 
+/// Simulate placing both legs **and persist** to the SQLite database.
+/// Returns the simulated orders. Skips if the pair+expiry already exists in DB.
+pub fn simulate_pair_entry_persistent(
+    db: &Db,
+    pair_label: &str,
+    yes_token_id: &str,
+    no_token_id: &str,
+    yes_price_low: f64,
+    no_price: f64,
+    balance: f64,
+    btc_price: f64,
+    expiry: &str,
+) -> Vec<SimulatedOrder> {
+    // Dedup: don't re-enter the same pair+expiry
+    if let Ok(true) = db.has_order_for_pair(pair_label, expiry) {
+        info!(
+            "[DRY-RUN] Skipping duplicate pair: {} (expiry {})",
+            pair_label, expiry
+        );
+        return vec![];
+    }
+
+    let orders = simulate_pair_entry(
+        pair_label,
+        yes_token_id,
+        no_token_id,
+        yes_price_low,
+        no_price,
+        balance,
+    );
+
+    for sim in &orders {
+        let db_order = DbOrder {
+            id: Uuid::new_v4().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            pair_label: sim.pair_label.clone(),
+            leg: sim.leg.clone(),
+            side: sim.side.clone(),
+            token_id: sim.token_id.clone(),
+            price: sim.price,
+            units: sim.units,
+            cost: sim.cost,
+            btc_price,
+            expiry: expiry.to_string(),
+            status: "open".to_string(),
+            pnl: 0.0,
+            settled_btc_price: 0.0,
+            settled_at: String::new(),
+        };
+        if let Err(e) = db.insert_order(&db_order) {
+            tracing::error!("[DRY-RUN] Failed to persist order: {e}");
+        }
+    }
+
+    orders
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +135,26 @@ mod tests {
         let total_cost: f64 = orders.iter().map(|o| o.cost).sum();
         // total cost should be <= 100 USDC
         assert!(total_cost <= 100.0 + 1e-9);
+    }
+
+    #[test]
+    fn test_persistent_entry_dedup() {
+        let db = Db::open_memory().unwrap();
+        let orders1 = simulate_pair_entry_persistent(
+            &db, "BTC $85k–$95k", "tok_y", "tok_n",
+            0.60, 0.35, 100.0, 90000.0, "2025-01-08T00:00:00Z",
+        );
+        assert_eq!(orders1.len(), 2);
+
+        // Second call with same pair+expiry should be skipped
+        let orders2 = simulate_pair_entry_persistent(
+            &db, "BTC $85k–$95k", "tok_y", "tok_n",
+            0.60, 0.35, 100.0, 90000.0, "2025-01-08T00:00:00Z",
+        );
+        assert_eq!(orders2.len(), 0);
+
+        // All 2 orders should be in DB
+        let all = db.get_all_orders().unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
