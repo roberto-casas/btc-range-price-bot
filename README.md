@@ -147,6 +147,48 @@ src/
 | `--dry-run` | off | Simulate trades only |
 | `--live` | off | Enable WebSocket price feed |
 
+## Configuración con fichero `bot-config.json`
+
+Ahora el bot carga parámetros por defecto desde `bot-config.json` (raíz del proyecto).
+Puedes ajustar ahí los valores de `scan` y `backtest` sin tocar el código.
+
+```bash
+# usar config por defecto
+./target/release/polydelta scan
+
+# usar otro fichero
+./target/release/polydelta --config ./mi-config.json backtest
+```
+
+Las flags CLI siguen teniendo prioridad sobre el fichero.
+
+Ejemplo de fichero:
+
+```json
+{
+  "scan": {
+    "timeframe": "week",
+    "port": 8080,
+    "balance": 100.0,
+    "interval": 300,
+    "dry_run": false,
+    "live": false
+  },
+  "backtest": {
+    "low_pct": 92.0,
+    "high_pct": 108.0,
+    "duration_days": 7,
+    "yes_price_low": 0.55,
+    "yes_price_high": 0.65,
+    "history_days": 90,
+    "stop_loss": 5.0,
+    "take_profit": 80.0,
+    "interval": "weekly",
+    "offline": false
+  }
+}
+```
+
 ## License
 
 MIT
