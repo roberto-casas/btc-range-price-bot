@@ -1,5 +1,6 @@
 mod analytics;
 mod backtesting;
+mod config;
 mod dashboard;
 mod dry_run;
 mod historical_data;
@@ -13,6 +14,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use config::load_config;
 use dashboard::AppState;
 use scanner::{calculate_structure, fetch_historical_btc, find_best_pairs, get_btc_price};
 use types::{OutputPair, ScanResult};
@@ -33,6 +35,10 @@ use types::{OutputPair, ScanResult};
     long_about = None,
 )]
 struct Cli {
+    /// Path to JSON config file with default bot parameters
+    #[arg(long, global = true, default_value = "bot-config.json")]
+    config: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -46,51 +52,51 @@ enum Command {
         dry_run: bool,
 
         /// Timeframe to scan: "week" or "month"
-        #[arg(long, default_value = "week")]
-        timeframe: String,
+        #[arg(long)]
+        timeframe: Option<String>,
 
         /// Port for the web dashboard
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Capital per pair in USDC (for cost breakdown display)
-        #[arg(long, default_value_t = 100.0)]
-        balance: f64,
+        #[arg(long)]
+        balance: Option<f64>,
 
         /// Enable WebSocket live price feed from Polymarket CLOB
         #[arg(long)]
         live: bool,
 
         /// Scan interval in seconds (0 = scan once and exit)
-        #[arg(long, default_value_t = 300)]
-        interval: u64,
+        #[arg(long)]
+        interval: Option<u64>,
     },
 
     /// Run a historical backtest of the strategy
     Backtest {
         /// Lower price bound as % of BTC spot (e.g. 92 = 92%)
-        #[arg(long, default_value_t = 92.0)]
-        low_pct: f64,
+        #[arg(long)]
+        low_pct: Option<f64>,
 
         /// Upper price bound as % of BTC spot (e.g. 108 = 108%)
-        #[arg(long, default_value_t = 108.0)]
-        high_pct: f64,
+        #[arg(long)]
+        high_pct: Option<f64>,
 
         /// Trade duration in days
-        #[arg(long, default_value_t = 7)]
-        duration_days: i64,
+        #[arg(long)]
+        duration_days: Option<i64>,
 
         /// Assumed YES-leg entry price (0..1)
-        #[arg(long, default_value_t = 0.55)]
-        yes_price_low: f64,
+        #[arg(long)]
+        yes_price_low: Option<f64>,
 
         /// Assumed HIGH-leg YES entry price (0..1)
-        #[arg(long, default_value_t = 0.65)]
-        yes_price_high: f64,
+        #[arg(long)]
+        yes_price_high: Option<f64>,
 
         /// Number of days of historical BTC data to fetch (ignored with --offline or --csv)
-        #[arg(long, default_value_t = 90)]
-        history_days: u32,
+        #[arg(long)]
+        history_days: Option<u32>,
 
         /// Use embedded historical data (~850 days, Jan 2023–Apr 2025) instead of API
         #[arg(long)]
@@ -103,18 +109,18 @@ enum Command {
         /// Stop-loss: close trade if BTC moves this % beyond the range thresholds.
         /// E.g. 5 = close if BTC drops 5% below low or rises 5% above high.
         /// Default: 5. Use --stop-loss 0 to disable.
-        #[arg(long, default_value = "5")]
+        #[arg(long)]
         stop_loss: Option<f64>,
 
         /// Take-profit: close early when BTC is within this fraction of the range center.
         /// E.g. 80 = take profit when 80% confident (past 50% of holding period).
         /// Default: 80. Use --take-profit 0 to disable.
-        #[arg(long, default_value = "80")]
+        #[arg(long)]
         take_profit: Option<f64>,
 
         /// Entry interval: "daily", "weekly", or "monthly"
-        #[arg(long, default_value = "weekly")]
-        interval: String,
+        #[arg(long)]
+        interval: Option<String>,
     },
 }
 
@@ -130,6 +136,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let config_path = std::path::Path::new(&cli.config);
+    let app_config = load_config(config_path)?;
+
     let http = reqwest::Client::builder()
         .user_agent("polydelta-rs/0.1")
         .build()?;
@@ -143,7 +152,24 @@ async fn main() -> Result<()> {
             live,
             interval,
         } => {
-            run_scan(http, dry_run, timeframe, port, balance, live, interval).await?;
+            let scan_defaults = app_config.scan;
+            let resolved_timeframe = timeframe.unwrap_or(scan_defaults.timeframe);
+            let resolved_port = port.unwrap_or(scan_defaults.port);
+            let resolved_balance = balance.unwrap_or(scan_defaults.balance);
+            let resolved_interval = interval.unwrap_or(scan_defaults.interval);
+            let resolved_dry_run = dry_run || scan_defaults.dry_run;
+            let resolved_live = live || scan_defaults.live;
+
+            run_scan(
+                http,
+                resolved_dry_run,
+                resolved_timeframe,
+                resolved_port,
+                resolved_balance,
+                resolved_live,
+                resolved_interval,
+            )
+            .await?;
         }
         Command::Backtest {
             low_pct,
@@ -158,22 +184,36 @@ async fn main() -> Result<()> {
             take_profit,
             interval,
         } => {
+            let backtest_defaults = app_config.backtest;
+            let resolved_low_pct = low_pct.unwrap_or(backtest_defaults.low_pct);
+            let resolved_high_pct = high_pct.unwrap_or(backtest_defaults.high_pct);
+            let resolved_duration_days = duration_days.unwrap_or(backtest_defaults.duration_days);
+            let resolved_yes_price_low = yes_price_low.unwrap_or(backtest_defaults.yes_price_low);
+            let resolved_yes_price_high =
+                yes_price_high.unwrap_or(backtest_defaults.yes_price_high);
+            let resolved_history_days = history_days.unwrap_or(backtest_defaults.history_days);
+            let resolved_offline = offline || backtest_defaults.offline;
+            let resolved_interval = interval.unwrap_or(backtest_defaults.interval);
+
             // Convert % to ratio; 0 disables the feature
-            let sl = stop_loss.filter(|&v| v > 0.0).map(|v| v / 100.0);
-            let tp = take_profit.filter(|&v| v > 0.0).map(|v| v / 100.0);
+            let stop_loss_value = stop_loss.unwrap_or(backtest_defaults.stop_loss);
+            let take_profit_value = take_profit.unwrap_or(backtest_defaults.take_profit);
+            let sl = (stop_loss_value > 0.0).then(|| stop_loss_value / 100.0);
+            let tp = (take_profit_value > 0.0).then(|| take_profit_value / 100.0);
+
             run_backtest_cli(
                 http,
-                low_pct / 100.0,
-                high_pct / 100.0,
-                duration_days,
-                yes_price_low,
-                yes_price_high,
-                history_days,
-                offline,
+                resolved_low_pct / 100.0,
+                resolved_high_pct / 100.0,
+                resolved_duration_days,
+                resolved_yes_price_low,
+                resolved_yes_price_high,
+                resolved_history_days,
+                resolved_offline,
                 csv,
                 sl,
                 tp,
-                interval,
+                resolved_interval,
             )
             .await?;
         }
@@ -288,12 +328,13 @@ async fn run_scan(
 
                 // In dry-run mode: print the simulated orders to stdout
                 if dry_run {
-                    let no_token = low
-                        .no_token_id
-                        .as_deref()
-                        .unwrap_or("unknown_no_token");
+                    let no_token = low.no_token_id.as_deref().unwrap_or("unknown_no_token");
                     const THOUSAND: f64 = 1000.0;
-                    let label = format!("BTC ${:.0}k–${:.0}k", low.threshold / THOUSAND, high.threshold / THOUSAND);
+                    let label = format!(
+                        "BTC ${:.0}k–${:.0}k",
+                        low.threshold / THOUSAND,
+                        high.threshold / THOUSAND
+                    );
                     dry_run::simulate_pair_entry(
                         &label,
                         &low.yes_token_id,
@@ -409,7 +450,10 @@ async fn run_backtest_cli(
     println!("  BACKTEST RESULTS");
     println!("{}", "=".repeat(60));
     println!("  Total trades    : {}", summary.total_trades);
-    println!("  Winning trades  : {} ({:.1}%)", summary.winning_trades, summary.win_rate);
+    println!(
+        "  Winning trades  : {} ({:.1}%)",
+        summary.winning_trades, summary.win_rate
+    );
     println!("  Losing trades   : {}", summary.losing_trades);
     println!("  Total PnL       : {:.4}", summary.total_pnl);
     println!("  Avg Profit %    : {:.2}%", summary.avg_profit_pct);
@@ -424,7 +468,10 @@ async fn run_backtest_cli(
 
     if !summary.trades.is_empty() {
         println!("\n  Recent trades (last 10):");
-        println!("  {:<12} {:<12} {:<22} {:<10} {:<10} {:<8}", "Entry", "Expiry", "Range", "BTC Exp.", "PnL", "Result");
+        println!(
+            "  {:<12} {:<12} {:<22} {:<10} {:<10} {:<8}",
+            "Entry", "Expiry", "Range", "BTC Exp.", "PnL", "Result"
+        );
         println!("  {}", "-".repeat(78));
         for t in summary.trades.iter().rev().take(10) {
             println!(
@@ -448,37 +495,76 @@ async fn run_backtest_cli(
     println!("{}", "=".repeat(60));
 
     println!("\n  Kelly Criterion (position sizing):");
-    println!("    Full Kelly    : {:.1}% of bankroll", report.kelly.full_kelly * 100.0);
-    println!("    Half Kelly    : {:.1}% (recommended)", report.kelly.half_kelly * 100.0);
-    println!("    Quarter Kelly : {:.1}% (conservative)", report.kelly.quarter_kelly * 100.0);
+    println!(
+        "    Full Kelly    : {:.1}% of bankroll",
+        report.kelly.full_kelly * 100.0
+    );
+    println!(
+        "    Half Kelly    : {:.1}% (recommended)",
+        report.kelly.half_kelly * 100.0
+    );
+    println!(
+        "    Quarter Kelly : {:.1}% (conservative)",
+        report.kelly.quarter_kelly * 100.0
+    );
     println!("    Edge          : {:.4}", report.kelly.edge);
     println!("    Win/Loss ratio: {:.2}", report.kelly.win_loss_ratio);
 
     println!("\n  Risk-Adjusted Returns:");
     println!("    Sharpe ratio  : {:.2}", report.risk.sharpe_ratio);
     println!("    Sortino ratio : {:.2}", report.risk.sortino_ratio);
-    println!("    Max drawdown  : {:.1}% ({:.2} abs)", report.risk.max_drawdown_pct, report.risk.max_drawdown_abs);
+    println!(
+        "    Max drawdown  : {:.1}% ({:.2} abs)",
+        report.risk.max_drawdown_pct, report.risk.max_drawdown_abs
+    );
     println!("    Calmar ratio  : {:.2}", report.risk.calmar_ratio);
     println!("    Profit factor : {:.2}", report.risk.profit_factor);
 
     println!("\n  Volatility Analysis:");
     println!("    Daily vol     : {:.2}%", report.volatility.daily_vol);
-    println!("    Annual vol    : {:.1}%", report.volatility.annualized_vol);
+    println!(
+        "    Annual vol    : {:.1}%",
+        report.volatility.annualized_vol
+    );
     println!("    ATR(14)       : {:.2}%", report.volatility.atr_14_pct);
-    println!("    Suggested rng : +/-{:.1}%", report.volatility.suggested_range_pct);
-    println!("    Vol regime    : {:.2}x (>1 = elevated)", report.volatility.vol_regime);
+    println!(
+        "    Suggested rng : +/-{:.1}%",
+        report.volatility.suggested_range_pct
+    );
+    println!(
+        "    Vol regime    : {:.2}x (>1 = elevated)",
+        report.volatility.vol_regime
+    );
 
     println!("\n  Monte Carlo (10k simulations):");
     println!("    Median PnL    : {:.2}", report.monte_carlo.median_pnl);
-    println!("    5th–95th pct  : [{:.2}, {:.2}]", report.monte_carlo.pnl_5th, report.monte_carlo.pnl_95th);
+    println!(
+        "    5th–95th pct  : [{:.2}, {:.2}]",
+        report.monte_carlo.pnl_5th, report.monte_carlo.pnl_95th
+    );
     println!("    P(profit)     : {:.1}%", report.monte_carlo.prob_profit);
-    println!("    Max DD (95th) : {:.2}", report.monte_carlo.max_drawdown_95th);
+    println!(
+        "    Max DD (95th) : {:.2}",
+        report.monte_carlo.max_drawdown_95th
+    );
 
     println!("\n  Expected Value:");
-    println!("    EV per trade  : {:.4} ({:.2}%)", report.expected_value.ev_per_trade, report.expected_value.ev_pct);
-    println!("    Breakeven WR  : {:.1}%", report.expected_value.breakeven_win_rate);
-    println!("    Actual WR     : {:.1}%", report.expected_value.actual_win_rate);
-    println!("    Edge over BE  : {:+.1}pp", report.expected_value.edge_over_breakeven);
+    println!(
+        "    EV per trade  : {:.4} ({:.2}%)",
+        report.expected_value.ev_per_trade, report.expected_value.ev_pct
+    );
+    println!(
+        "    Breakeven WR  : {:.1}%",
+        report.expected_value.breakeven_win_rate
+    );
+    println!(
+        "    Actual WR     : {:.1}%",
+        report.expected_value.actual_win_rate
+    );
+    println!(
+        "    Edge over BE  : {:+.1}pp",
+        report.expected_value.edge_over_breakeven
+    );
     println!("{}", "=".repeat(60));
 
     Ok(())
@@ -486,6 +572,12 @@ async fn run_backtest_cli(
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-fn round4(x: f64) -> f64 { (x * 10000.0).round() / 10000.0 }
-fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
-fn round1(x: f64) -> f64 { (x * 10.0).round() / 10.0 }
+fn round4(x: f64) -> f64 {
+    (x * 10000.0).round() / 10000.0
+}
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
