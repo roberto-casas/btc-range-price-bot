@@ -47,6 +47,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/orders", get(orders_handler))
         .route("/api/price-history", get(price_history_handler))
         .route("/api/snapshots", get(snapshots_handler))
+        .route("/api/evaluations", get(evaluations_handler))
         .with_state(state)
         .layer(CorsLayer::permissive())
 }
@@ -185,6 +186,18 @@ async fn price_history_handler(State(state): State<AppState>) -> impl IntoRespon
 async fn snapshots_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.get_all_snapshots() {
         Ok(snaps) => Json(serde_json::to_value(snaps).unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Return evaluation/decision history (newest first, up to 200)
+async fn evaluations_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.get_evaluations(200) {
+        Ok(evals) => Json(serde_json::to_value(evals).unwrap_or_default()).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("DB error: {e}") })),
@@ -446,6 +459,39 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     .bt-trades-table tr:last-child td { border-bottom: none; }
     .won-yes { color: var(--green); font-weight: 600; }
     .won-no  { color: var(--red);   font-weight: 600; }
+    .eval-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .eval-badge.entered  { background: rgba(0,192,118,0.15); color: var(--green); border: 1px solid rgba(0,192,118,0.3); }
+    .eval-badge.skipped  { background: rgba(244,63,94,0.15);  color: var(--red);   border: 1px solid rgba(244,63,94,0.3); }
+    .eval-badge.scanned  { background: rgba(59,130,246,0.15); color: var(--blue);  border: 1px solid rgba(59,130,246,0.3); }
+    .eval-badge.no-pairs { background: rgba(100,116,139,0.15); color: var(--muted); border: 1px solid rgba(100,116,139,0.3); }
+    .eval-risk-low     { color: var(--green); }
+    .eval-risk-medium  { color: var(--yellow); }
+    .eval-risk-high    { color: var(--red); }
+    .eval-risk-extreme { color: var(--red); font-weight: 700; }
+    .eval-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 10px;
+    }
+    .eval-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+    .eval-time { font-size: 12px; color: var(--muted); }
+    .eval-details { font-size: 12px; color: var(--text); line-height: 1.6; }
+    .eval-reasoning { font-size: 12px; color: var(--muted); margin-top: 6px; font-style: italic; }
+    .eval-factors { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .eval-stats-row { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; }
+    .eval-stat { font-size: 11px; color: var(--muted); }
+    .eval-stat span { color: var(--text); font-weight: 600; }
+    .eval-filters { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
   </style>
 </head>
 <body>
@@ -468,6 +514,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button class="tab-btn active" onclick="showTab('scanner')">📊 Scanner</button>
       <button class="tab-btn" onclick="showTab('backtest')">📈 Backtesting</button>
       <button class="tab-btn" onclick="showTab('portfolio')" id="tab-btn-portfolio" style="display:none;">💼 Portfolio</button>
+      <button class="tab-btn" onclick="showTab('evaluations')">📋 Evaluations</button>
     </div>
 
     <!-- Scanner tab -->
@@ -543,6 +590,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <div class="tab-panel" id="tab-portfolio">
       <div id="portfolio-content">
         <div class="message"><div class="icon">⏳</div><p>Loading portfolio data...</p></div>
+      </div>
+    </div>
+
+    <!-- Evaluations tab -->
+    <div class="tab-panel" id="tab-evaluations">
+      <div id="evaluations-content">
+        <div class="message"><div class="icon">⏳</div><p>Loading evaluation history...</p></div>
       </div>
     </div>
   </main>
@@ -856,9 +910,98 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       scannerTab.insertBefore(el, scannerTab.firstChild);
     }
 
+    // ── Evaluations ──────────────────────────────────────
+    let evalFilter = 'all';
+
+    async function loadEvaluations() {
+      try {
+        const resp = await fetch('/api/evaluations');
+        if (!resp.ok) return;
+        const evals = await resp.json();
+        renderEvaluations(evals);
+      } catch (e) {
+        document.getElementById('evaluations-content').innerHTML =
+          `<div class="message"><div class="icon">⚠️</div><p>${esc(e.message)}</p></div>`;
+      }
+    }
+
+    function renderEvaluations(evals) {
+      if (!Array.isArray(evals) || evals.length === 0) {
+        document.getElementById('evaluations-content').innerHTML =
+          '<div class="message"><div class="icon">📭</div><p>No evaluations yet. Waiting for scan cycles...</p></div>';
+        return;
+      }
+
+      const counts = { all: evals.length, entered: 0, skipped: 0, no_pairs: 0 };
+      evals.forEach(e => {
+        if (e.decision === 'entered') counts.entered++;
+        else if (e.decision.startsWith('skipped')) counts.skipped++;
+        else if (e.decision === 'no_pairs') counts.no_pairs++;
+      });
+
+      const filtered = evalFilter === 'all' ? evals :
+        evalFilter === 'skipped' ? evals.filter(e => e.decision.startsWith('skipped')) :
+        evals.filter(e => e.decision === evalFilter);
+
+      let html = `<div class="eval-filters">
+        <span class="toolbar-label">Filter</span>
+        <button class="sort-btn ${evalFilter==='all'?'active':''}" onclick="setEvalFilter('all')">All (${counts.all})</button>
+        <button class="sort-btn ${evalFilter==='entered'?'active':''}" onclick="setEvalFilter('entered')">Entered (${counts.entered})</button>
+        <button class="sort-btn ${evalFilter==='skipped'?'active':''}" onclick="setEvalFilter('skipped')">Skipped (${counts.skipped})</button>
+        <button class="sort-btn ${evalFilter==='no_pairs'?'active':''}" onclick="setEvalFilter('no_pairs')">No Pairs (${counts.no_pairs})</button>
+      </div>`;
+
+      html += `<div class="bt-summary">
+        <div class="bt-stat"><div class="bt-stat-label">Total Evaluations</div><div class="bt-stat-value">${evals.length}</div></div>
+        <div class="bt-stat"><div class="bt-stat-label">Trades Entered</div><div class="bt-stat-value green">${counts.entered}</div></div>
+        <div class="bt-stat"><div class="bt-stat-label">Trades Skipped</div><div class="bt-stat-value red">${counts.skipped}</div></div>
+        <div class="bt-stat"><div class="bt-stat-label">No Pairs Found</div><div class="bt-stat-value">${counts.no_pairs}</div></div>
+      </div>`;
+
+      filtered.slice(0, 100).forEach(e => {
+        const dt = new Date(e.created_at);
+        const timeStr = dt.toLocaleDateString('en-US', {day:'numeric',month:'short'}) + ' ' + dt.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit'});
+        const decClass = e.decision === 'entered' ? 'entered' : e.decision === 'no_pairs' ? 'no-pairs' : e.decision.startsWith('skipped') ? 'skipped' : 'scanned';
+        const decLabel = e.decision === 'entered' ? 'Entered' : e.decision === 'skipped_ai' ? 'Skipped (AI)' : e.decision === 'skipped_duplicate' ? 'Skipped (Dup)' : e.decision === 'no_pairs' ? 'No Pairs' : e.decision === 'scanned' ? 'Scanned' : e.decision;
+        const riskClass = 'eval-risk-' + (e.risk_level || 'low');
+
+        let factors = [];
+        try { factors = JSON.parse(e.risk_factors || '[]'); } catch(_) {}
+
+        html += `<div class="eval-card">
+          <div class="eval-header">
+            <span class="eval-time">${timeStr}</span>
+            <span class="eval-badge ${decClass}">${decLabel}</span>
+            ${e.risk_level && e.risk_level !== 'n/a' ? `<span class="${riskClass}" style="font-size:11px;font-weight:600;">Risk: ${e.risk_level.toUpperCase()}</span>` : ''}
+            ${e.confidence > 0 ? `<span style="font-size:11px;color:var(--muted);">Confidence: ${(e.confidence*100).toFixed(0)}%</span>` : ''}
+            ${e.skip_trade ? '<span style="font-size:10px;font-weight:700;color:var(--red);">SKIP RECOMMENDED</span>' : ''}
+          </div>
+          <div class="eval-details">
+            ${e.pair_label ? `<strong>${esc(e.pair_label)}</strong> ·` : ''}
+            ${e.pairs_found > 0 ? `${e.pairs_found} pair${e.pairs_found>1?'s':''} found ·` : ''}
+            BTC $${fmt(e.btc_price)}
+            ${e.profit_pct > 0 ? ` · Profit: +${e.profit_pct.toFixed(1)}%` : ''}
+            ${e.days_until > 0 ? ` · ${e.days_until}d to expiry` : ''}
+          </div>
+          ${e.reasoning ? `<div class="eval-reasoning">"${esc(e.reasoning)}"</div>` : ''}
+          ${factors.length > 0 ? `<div class="eval-factors">Risk factors: ${factors.map(f => esc(f)).join(' · ')}</div>` : ''}
+          ${(e.suggested_low_adj || e.suggested_high_adj) ? `<div class="eval-stats-row"><div class="eval-stat">Range adjust: low <span>${e.suggested_low_adj >= 0 ? '+' : ''}${e.suggested_low_adj.toFixed(1)}%</span> / high <span>${e.suggested_high_adj >= 0 ? '+' : ''}${e.suggested_high_adj.toFixed(1)}%</span></div></div>` : ''}
+        </div>`;
+      });
+
+      if (filtered.length > 100) {
+        html += `<p style="color:var(--muted);font-size:12px;margin-top:8px;">Showing first 100 of ${filtered.length} evaluations.</p>`;
+      }
+
+      document.getElementById('evaluations-content').innerHTML = html;
+    }
+
+    function setEvalFilter(f) { evalFilter = f; loadEvaluations(); }
+
     // Auto-refresh every 60 seconds
     loadData();
-    setInterval(loadData, 60_000);
+    loadEvaluations();
+    setInterval(() => { loadData(); loadEvaluations(); }, 60_000);
   </script>
 </body>
 </html>

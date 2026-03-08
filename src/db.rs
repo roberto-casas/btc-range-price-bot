@@ -65,6 +65,39 @@ pub struct DbPricePoint {
     pub btc_price: f64,
 }
 
+/// A persisted market evaluation and decision record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbEvaluation {
+    pub id: i64,
+    pub created_at: String,
+    /// BTC/USD at the time of evaluation.
+    pub btc_price: f64,
+    /// Label of the best pair evaluated (e.g. "BTC $85k–$95k").
+    pub pair_label: String,
+    pub low_threshold: f64,
+    pub high_threshold: f64,
+    pub profit_pct: f64,
+    pub days_until: i64,
+    /// Number of delta-neutral pairs found in this scan.
+    pub pairs_found: i64,
+    /// AI risk level: "low", "medium", "high", "extreme", or "n/a" if AI disabled.
+    pub risk_level: String,
+    /// AI confidence 0.0–1.0 (0.0 if AI disabled).
+    pub confidence: f64,
+    /// Whether AI recommended skipping this trade.
+    pub skip_trade: bool,
+    /// AI reasoning text.
+    pub reasoning: String,
+    /// JSON array of risk factor strings.
+    pub risk_factors: String,
+    /// Suggested low boundary adjustment %.
+    pub suggested_low_adj: f64,
+    /// Suggested high boundary adjustment %.
+    pub suggested_high_adj: f64,
+    /// Decision taken: "entered", "skipped_ai", "skipped_duplicate", "no_pairs".
+    pub decision: String,
+}
+
 // ── Database handle ──────────────────────────────────────────────────────────
 
 /// Thread-safe wrapper around a SQLite connection.
@@ -140,9 +173,30 @@ impl Db {
                 btc_price       REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS evaluations (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at         TEXT NOT NULL,
+                btc_price          REAL NOT NULL,
+                pair_label         TEXT NOT NULL DEFAULT '',
+                low_threshold      REAL NOT NULL DEFAULT 0,
+                high_threshold     REAL NOT NULL DEFAULT 0,
+                profit_pct         REAL NOT NULL DEFAULT 0,
+                days_until         INTEGER NOT NULL DEFAULT 0,
+                pairs_found        INTEGER NOT NULL DEFAULT 0,
+                risk_level         TEXT NOT NULL DEFAULT 'n/a',
+                confidence         REAL NOT NULL DEFAULT 0,
+                skip_trade         INTEGER NOT NULL DEFAULT 0,
+                reasoning          TEXT NOT NULL DEFAULT '',
+                risk_factors       TEXT NOT NULL DEFAULT '[]',
+                suggested_low_adj  REAL NOT NULL DEFAULT 0,
+                suggested_high_adj REAL NOT NULL DEFAULT 0,
+                decision           TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_orders_expiry ON orders(expiry);
             CREATE INDEX IF NOT EXISTS idx_price_history_created ON price_history(created_at);
+            CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
             ",
         )?;
         Ok(())
@@ -393,6 +447,81 @@ impl Db {
             points.push(row?);
         }
         Ok(points)
+    }
+
+    // ── Evaluations ──────────────────────────────────────────────────────────
+
+    /// Record a market evaluation and the decision taken.
+    pub fn insert_evaluation(&self, eval: &DbEvaluation) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO evaluations
+                (created_at, btc_price, pair_label, low_threshold, high_threshold,
+                 profit_pct, days_until, pairs_found, risk_level, confidence,
+                 skip_trade, reasoning, risk_factors, suggested_low_adj,
+                 suggested_high_adj, decision)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                eval.created_at,
+                eval.btc_price,
+                eval.pair_label,
+                eval.low_threshold,
+                eval.high_threshold,
+                eval.profit_pct,
+                eval.days_until,
+                eval.pairs_found,
+                eval.risk_level,
+                eval.confidence,
+                eval.skip_trade as i32,
+                eval.reasoning,
+                eval.risk_factors,
+                eval.suggested_low_adj,
+                eval.suggested_high_adj,
+                eval.decision,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all evaluations (newest first, up to `limit`).
+    pub fn get_evaluations(&self, limit: u32) -> Result<Vec<DbEvaluation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, btc_price, pair_label, low_threshold,
+                    high_threshold, profit_pct, days_until, pairs_found,
+                    risk_level, confidence, skip_trade, reasoning,
+                    risk_factors, suggested_low_adj, suggested_high_adj, decision
+             FROM evaluations ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(DbEvaluation {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                btc_price: row.get(2)?,
+                pair_label: row.get(3)?,
+                low_threshold: row.get(4)?,
+                high_threshold: row.get(5)?,
+                profit_pct: row.get(6)?,
+                days_until: row.get(7)?,
+                pairs_found: row.get(8)?,
+                risk_level: row.get(9)?,
+                confidence: row.get(10)?,
+                skip_trade: {
+                    let v: i32 = row.get(11)?;
+                    v != 0
+                },
+                reasoning: row.get(12)?,
+                risk_factors: row.get(13)?,
+                suggested_low_adj: row.get(14)?,
+                suggested_high_adj: row.get(15)?,
+                decision: row.get(16)?,
+            })
+        })?;
+        let mut evals = Vec::new();
+        for row in rows {
+            evals.push(row?);
+        }
+        Ok(evals)
     }
 
     // ── Aggregate helpers ────────────────────────────────────────────────────
