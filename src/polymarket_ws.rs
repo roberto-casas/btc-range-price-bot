@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -38,18 +38,34 @@ struct RawTick {
     side: Option<String>,
 }
 
-/// Start a WebSocket listener that subscribes to the given market token IDs
-/// and broadcasts price updates to the returned receiver channel.
+/// Start a WebSocket listener that dynamically subscribes to market token IDs
+/// received via a `watch` channel and broadcasts price updates.
 ///
 /// The task runs indefinitely in the background; cancel it by dropping the
 /// `broadcast::Sender` handle.
+///
+/// When new token IDs arrive on `token_rx`, the listener reconnects and
+/// subscribes to the updated list.
 pub async fn start_ws_listener(
-    token_ids: Vec<String>,
+    mut token_rx: watch::Receiver<Vec<String>>,
     tx: broadcast::Sender<PriceUpdate>,
 ) -> Result<()> {
     let url = Url::parse(WS_URL)?;
 
     loop {
+        let token_ids = token_rx.borrow_and_update().clone();
+
+        if token_ids.is_empty() {
+            info!("No tokens to subscribe to yet. Waiting for scanner results...");
+            // Wait until the scanner sends us token IDs
+            if token_rx.changed().await.is_err() {
+                // Sender dropped — shut down
+                info!("Token watch channel closed. Stopping WebSocket listener.");
+                return Ok(());
+            }
+            continue;
+        }
+
         info!("Connecting to Polymarket WebSocket at {WS_URL}...");
         let ws_stream = match connect_async(url.as_str()).await {
             Ok((ws, _)) => ws,
@@ -74,30 +90,44 @@ pub async fn start_ws_listener(
             continue;
         }
 
-        // Process incoming messages
-        while let Some(msg) = reader.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("WS msg: {text}");
-                    process_ws_message(&text, &tx);
+        // Process incoming messages until an error occurs or tokens are updated
+        loop {
+            tokio::select! {
+                msg = reader.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            debug!("WS msg: {text}");
+                            process_ws_message(&text, &tx);
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = writer.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            warn!("WebSocket closed by server. Reconnecting...");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {e}. Reconnecting...");
+                            break;
+                        }
+                        None => {
+                            warn!("WebSocket stream ended. Reconnecting...");
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(Message::Ping(data)) => {
-                    // Respond to pings
-                    let _ = writer.send(Message::Pong(data)).await;
-                }
-                Ok(Message::Close(_)) => {
-                    warn!("WebSocket closed by server. Reconnecting...");
+                result = token_rx.changed() => {
+                    if result.is_err() {
+                        info!("Token watch channel closed. Stopping WebSocket listener.");
+                        return Ok(());
+                    }
+                    info!("Token list updated. Reconnecting to re-subscribe...");
                     break;
                 }
-                Err(e) => {
-                    error!("WebSocket error: {e}. Reconnecting...");
-                    break;
-                }
-                _ => {}
             }
         }
 
-        warn!("WebSocket disconnected. Reconnecting in 3s...");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
