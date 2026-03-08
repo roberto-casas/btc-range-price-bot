@@ -23,6 +23,7 @@ impl Default for AppConfig {
 #[serde(default)]
 pub struct ScanConfig {
     pub timeframe: String,
+    pub host: String,
     pub port: u16,
     pub balance: f64,
     pub interval: u64,
@@ -34,6 +35,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             timeframe: "week".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 8080,
             balance: 100.0,
             interval: 300,

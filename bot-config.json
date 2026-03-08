@@ -1,6 +1,7 @@
 {
   "scan": {
     "timeframe": "week",
+    "host": "0.0.0.0",
     "port": 8080,
     "balance": 100.0,
     "interval": 300,

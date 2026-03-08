@@ -206,12 +206,12 @@ async fn evaluations_handler(State(state): State<AppState>) -> impl IntoResponse
     }
 }
 
-/// Start the HTTP server on the given port
-pub async fn start_server(state: AppState, port: u16) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    info!("Dashboard listening on http://127.0.0.1:{port}");
-    info!("  → Main dashboard: http://127.0.0.1:{port}/");
-    info!("  → JSON API:       http://127.0.0.1:{port}/api/data");
+/// Start the HTTP server on the given host and port
+pub async fn start_server(state: AppState, host: &str, port: u16) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    info!("Dashboard listening on http://{host}:{port}");
+    info!("  → Main dashboard: http://{host}:{port}/");
+    info!("  → JSON API:       http://{host}:{port}/api/data");
 
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
