@@ -130,6 +130,21 @@ enum Command {
         /// Entry interval: "daily", "weekly", or "monthly"
         #[arg(long)]
         interval: Option<String>,
+
+        /// Spread per leg as percentage (e.g. 2 = 2% spread on each leg).
+        /// Simulates bid/ask spread cost. Default: 0.
+        #[arg(long)]
+        spread: Option<f64>,
+
+        /// Platform fee as percentage of trade value (e.g. 1 = 1% fee).
+        /// Applied on entry and exit. Default: 0.
+        #[arg(long)]
+        fee: Option<f64>,
+
+        /// Slippage as percentage (e.g. 0.5 = 0.5% price impact).
+        /// Applied to both legs at entry. Default: 0.
+        #[arg(long)]
+        slippage: Option<f64>,
     },
 }
 
@@ -194,6 +209,9 @@ async fn main() -> Result<()> {
             stop_loss,
             take_profit,
             interval,
+            spread,
+            fee,
+            slippage,
         } => {
             let backtest_defaults = app_config.backtest;
             let resolved_low_pct = low_pct.unwrap_or(backtest_defaults.low_pct);
@@ -212,6 +230,11 @@ async fn main() -> Result<()> {
             let sl = (stop_loss_value > 0.0).then(|| stop_loss_value / 100.0);
             let tp = (take_profit_value > 0.0).then(|| take_profit_value / 100.0);
 
+            // Convert cost % to fractions
+            let spread_frac = spread.map(|s| s / 100.0);
+            let fee_frac = fee.map(|f| f / 100.0);
+            let slippage_frac = slippage.map(|s| s / 100.0);
+
             run_backtest_cli(
                 http,
                 resolved_low_pct / 100.0,
@@ -225,6 +248,9 @@ async fn main() -> Result<()> {
                 sl,
                 tp,
                 resolved_interval,
+                spread_frac,
+                fee_frac,
+                slippage_frac,
             )
             .await?;
         }
@@ -570,6 +596,9 @@ async fn run_backtest_cli(
     stop_loss_pct: Option<f64>,
     take_profit_pct: Option<f64>,
     entry_interval: String,
+    spread_per_leg: Option<f64>,
+    fee_pct: Option<f64>,
+    slippage_pct: Option<f64>,
 ) -> Result<()> {
     info!(
         "Running backtest: range=[{:.0}%–{:.0}%], duration={}d, interval={}",
@@ -600,13 +629,40 @@ async fn run_backtest_cli(
         stop_loss_pct,
         take_profit_pct,
         entry_interval: entry_interval.clone(),
+        spread_per_leg,
+        fee_pct,
+        slippage_pct,
     };
 
     let summary = backtesting::run_backtest_advanced(&candles, &config);
 
+    // Compute effective costs for display
+    let no_price = 1.0 - yes_price_high;
+    let spread_val = spread_per_leg.unwrap_or(0.0);
+    let slip_val = slippage_pct.unwrap_or(0.0);
+    let fee_val = fee_pct.unwrap_or(0.0);
+    let eff_yes = yes_price_low * (1.0 + spread_val + slip_val);
+    let eff_no = no_price * (1.0 + spread_val + slip_val);
+    let raw_cost = eff_yes + eff_no;
+    let total_cost = raw_cost * (1.0 + fee_val);
+    let exit_fees = 2.0 * fee_val;
+    let net_profit = 2.0 - exit_fees - total_cost;
+
     println!("\n{}", "=".repeat(60));
     println!("  BACKTEST RESULTS");
     println!("{}", "=".repeat(60));
+    if spread_val > 0.0 || slip_val > 0.0 || fee_val > 0.0 {
+        println!("  -- Trading Costs --");
+        println!("  Spread/leg      : {:.1}%", spread_val * 100.0);
+        println!("  Slippage        : {:.1}%", slip_val * 100.0);
+        println!("  Platform fee    : {:.1}%", fee_val * 100.0);
+        println!("  Nominal prices  : YES_low={:.2} NO_high={:.2}", yes_price_low, no_price);
+        println!("  Effective prices: YES_low={:.4} NO_high={:.4}", eff_yes, eff_no);
+        println!("  Effective cost  : {:.4} (nominal: {:.4})", total_cost, yes_price_low + no_price);
+        println!("  Net profit/win  : {:.4} (nominal: {:.4})", net_profit, 2.0 - yes_price_low - no_price);
+        println!("  Effective ROI   : {:.1}%", (net_profit / total_cost) * 100.0);
+        println!("  ---");
+    }
     println!("  Total trades    : {}", summary.total_trades);
     println!(
         "  Winning trades  : {} ({:.1}%)",

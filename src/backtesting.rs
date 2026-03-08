@@ -27,6 +27,9 @@ pub fn run_backtest(
         stop_loss_pct: None,
         take_profit_pct: None,
         entry_interval: "daily".to_string(),
+        spread_per_leg: None,
+        fee_pct: None,
+        slippage_pct: None,
     };
     run_backtest_advanced(candles, &config)
 }
@@ -51,8 +54,25 @@ pub fn run_backtest_advanced(candles: &[Candle], config: &BacktestConfig) -> Bac
     }
 
     let no_price = 1.0 - config.yes_price_high;
-    let cost_per_unit = config.yes_price_low + no_price;
-    let profit_in_rng = 2.0 - cost_per_unit;
+
+    // Apply trading costs: spread + slippage increase effective entry prices
+    let spread = config.spread_per_leg.unwrap_or(0.0);
+    let slippage = config.slippage_pct.unwrap_or(0.0);
+    let fee = config.fee_pct.unwrap_or(0.0);
+
+    // Spread and slippage worsen entry prices (buy higher YES, buy higher NO)
+    let effective_yes_low = config.yes_price_low * (1.0 + spread + slippage);
+    let effective_no_price = no_price * (1.0 + spread + slippage);
+
+    // Total cost includes fees on both legs
+    let raw_cost = effective_yes_low + effective_no_price;
+    let total_fees = raw_cost * fee;
+    let cost_per_unit = raw_cost + total_fees;
+
+    // Payout is always $1 per winning leg, minus exit fees
+    // When winning, both legs pay $1 each = $2, minus exit fees
+    let exit_fees = 2.0 * fee;
+    let profit_in_rng = 2.0 - exit_fees - cost_per_unit;
     let profit_pct = (profit_in_rng / cost_per_unit) * 100.0;
 
     let mut trades: Vec<BacktestTrade> = Vec::new();
@@ -343,6 +363,9 @@ mod tests {
             stop_loss_pct: Some(0.05), // 5% beyond range = SL
             take_profit_pct: None,
             entry_interval: "daily".to_string(),
+            spread_per_leg: None,
+            fee_pct: None,
+            slippage_pct: None,
         };
 
         let summary = run_backtest_advanced(&candles, &config);
@@ -366,6 +389,9 @@ mod tests {
             stop_loss_pct: None,
             take_profit_pct: None,
             entry_interval: "weekly".to_string(),
+            spread_per_leg: None,
+            fee_pct: None,
+            slippage_pct: None,
         };
         let weekly = run_backtest_advanced(&candles, &config_weekly);
 
@@ -389,6 +415,9 @@ mod tests {
             stop_loss_pct: None,
             take_profit_pct: None,
             entry_interval: "monthly".to_string(),
+            spread_per_leg: None,
+            fee_pct: None,
+            slippage_pct: None,
         };
         let monthly = run_backtest_advanced(&candles, &config);
 
