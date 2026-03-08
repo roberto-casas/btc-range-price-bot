@@ -161,6 +161,18 @@ pub struct BacktestConfig {
     /// Data interval for sampling: "daily", "weekly", or "monthly".
     /// Controls how frequently new trades are opened.
     pub entry_interval: String,
+    /// Spread cost per leg as a fraction (e.g. 0.02 = 2% spread).
+    /// Applied to both entry and exit. None = no spread.
+    #[serde(default)]
+    pub spread_per_leg: Option<f64>,
+    /// Platform fee as a fraction of trade value (e.g. 0.01 = 1%).
+    /// None = no fees.
+    #[serde(default)]
+    pub fee_pct: Option<f64>,
+    /// Slippage as a fraction of price (e.g. 0.005 = 0.5%).
+    /// Applied to both legs at entry. None = no slippage.
+    #[serde(default)]
+    pub slippage_pct: Option<f64>,
 }
 
 impl Default for BacktestConfig {
@@ -183,6 +195,9 @@ impl Default for BacktestConfig {
             stop_loss_pct: Some(0.05),
             take_profit_pct: Some(0.80),
             entry_interval: "weekly".to_string(),
+            spread_per_leg: None,
+            fee_pct: None,
+            slippage_pct: None,
         }
     }
 }
