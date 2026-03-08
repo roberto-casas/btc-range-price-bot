@@ -1,6 +1,8 @@
+mod analytics;
 mod backtesting;
 mod dashboard;
 mod dry_run;
+mod historical_data;
 mod polymarket_ws;
 mod scanner;
 mod types;
@@ -12,7 +14,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use dashboard::AppState;
-use scanner::{calculate_structure, find_best_pairs, fetch_historical_btc, get_btc_price};
+use scanner::{calculate_structure, fetch_historical_btc, find_best_pairs, get_btc_price};
 use types::{OutputPair, ScanResult};
 
 // ── CLI definition ─────────────────────────────────────────────────────────────
@@ -86,9 +88,31 @@ enum Command {
         #[arg(long, default_value_t = 0.70)]
         yes_price_high: f64,
 
-        /// Number of days of historical BTC data to fetch
+        /// Number of days of historical BTC data to fetch (ignored with --offline or --csv)
         #[arg(long, default_value_t = 90)]
         history_days: u32,
+
+        /// Use embedded historical data (~850 days, Jan 2023–Apr 2025) instead of API
+        #[arg(long)]
+        offline: bool,
+
+        /// Load BTC price data from a CSV file (format: date,open,high,low,close)
+        #[arg(long)]
+        csv: Option<String>,
+
+        /// Stop-loss: close trade if BTC moves this % beyond the range thresholds.
+        /// E.g. 5 = close if BTC drops 5% below low or rises 5% above high.
+        #[arg(long)]
+        stop_loss: Option<f64>,
+
+        /// Take-profit: close early when BTC is within this fraction of the range center.
+        /// E.g. 80 = take profit when 80% confident (past 50% of holding period).
+        #[arg(long)]
+        take_profit: Option<f64>,
+
+        /// Entry interval: "daily", "weekly", or "monthly"
+        #[arg(long, default_value = "daily")]
+        interval: String,
     },
 }
 
@@ -126,6 +150,11 @@ async fn main() -> Result<()> {
             yes_price_low,
             yes_price_high,
             history_days,
+            offline,
+            csv,
+            stop_loss,
+            take_profit,
+            interval,
         } => {
             run_backtest_cli(
                 http,
@@ -135,6 +164,11 @@ async fn main() -> Result<()> {
                 yes_price_low,
                 yes_price_high,
                 history_days,
+                offline,
+                csv,
+                stop_loss.map(|v| v / 100.0),
+                take_profit.map(|v| v / 100.0),
+                interval,
             )
             .await?;
         }
@@ -327,26 +361,44 @@ async fn run_backtest_cli(
     yes_price_low: f64,
     yes_price_high: f64,
     history_days: u32,
+    offline: bool,
+    csv_path: Option<String>,
+    stop_loss_pct: Option<f64>,
+    take_profit_pct: Option<f64>,
+    entry_interval: String,
 ) -> Result<()> {
     info!(
-        "📈 Running backtest: range=[{:.0}%–{:.0}%], duration={}d, history={}d",
+        "📈 Running backtest: range=[{:.0}%–{:.0}%], duration={}d, interval={}",
         low_ratio * 100.0,
         high_ratio * 100.0,
         duration_days,
-        history_days,
+        entry_interval,
     );
 
-    let candles = fetch_historical_btc(&http, history_days).await?;
-    info!("Fetched {} daily candles", candles.len());
+    let candles = if let Some(ref path) = csv_path {
+        info!("Loading data from CSV: {path}");
+        historical_data::load_candles_from_csv(std::path::Path::new(path))?
+    } else if offline {
+        info!("Using embedded historical data");
+        historical_data::generate_embedded_candles()
+    } else {
+        info!("Fetching {history_days}d from CoinGecko...");
+        fetch_historical_btc(&http, history_days).await?
+    };
+    info!("Loaded {} daily candles", candles.len());
 
-    let summary = backtesting::run_backtest(
-        &candles,
+    let config = types::BacktestConfig {
         low_ratio,
         high_ratio,
         duration_days,
         yes_price_low,
         yes_price_high,
-    );
+        stop_loss_pct,
+        take_profit_pct,
+        entry_interval: entry_interval.clone(),
+    };
+
+    let summary = backtesting::run_backtest_advanced(&candles, &config);
 
     println!("\n{}", "=".repeat(60));
     println!("  BACKTEST RESULTS");
@@ -356,6 +408,13 @@ async fn run_backtest_cli(
     println!("  Losing trades   : {}", summary.losing_trades);
     println!("  Total PnL       : {:.4}", summary.total_pnl);
     println!("  Avg Profit %    : {:.2}%", summary.avg_profit_pct);
+    if summary.stopped_out > 0 {
+        println!("  Stopped out     : {}", summary.stopped_out);
+    }
+    if summary.took_profit > 0 {
+        println!("  Took profit     : {}", summary.took_profit);
+    }
+    println!("  Entry interval  : {}", entry_interval);
     println!("{}", "=".repeat(60));
 
     if !summary.trades.is_empty() {
@@ -375,6 +434,47 @@ async fn run_backtest_cli(
             );
         }
     }
+
+    // Advanced analytics
+    let report = analytics::full_report(&summary, &candles, duration_days as u64);
+
+    println!("\n{}", "=".repeat(60));
+    println!("  ADVANCED ANALYTICS");
+    println!("{}", "=".repeat(60));
+
+    println!("\n  Kelly Criterion (position sizing):");
+    println!("    Full Kelly    : {:.1}% of bankroll", report.kelly.full_kelly * 100.0);
+    println!("    Half Kelly    : {:.1}% (recommended)", report.kelly.half_kelly * 100.0);
+    println!("    Quarter Kelly : {:.1}% (conservative)", report.kelly.quarter_kelly * 100.0);
+    println!("    Edge          : {:.4}", report.kelly.edge);
+    println!("    Win/Loss ratio: {:.2}", report.kelly.win_loss_ratio);
+
+    println!("\n  Risk-Adjusted Returns:");
+    println!("    Sharpe ratio  : {:.2}", report.risk.sharpe_ratio);
+    println!("    Sortino ratio : {:.2}", report.risk.sortino_ratio);
+    println!("    Max drawdown  : {:.1}% ({:.2} abs)", report.risk.max_drawdown_pct, report.risk.max_drawdown_abs);
+    println!("    Calmar ratio  : {:.2}", report.risk.calmar_ratio);
+    println!("    Profit factor : {:.2}", report.risk.profit_factor);
+
+    println!("\n  Volatility Analysis:");
+    println!("    Daily vol     : {:.2}%", report.volatility.daily_vol);
+    println!("    Annual vol    : {:.1}%", report.volatility.annualized_vol);
+    println!("    ATR(14)       : {:.2}%", report.volatility.atr_14_pct);
+    println!("    Suggested rng : +/-{:.1}%", report.volatility.suggested_range_pct);
+    println!("    Vol regime    : {:.2}x (>1 = elevated)", report.volatility.vol_regime);
+
+    println!("\n  Monte Carlo (10k simulations):");
+    println!("    Median PnL    : {:.2}", report.monte_carlo.median_pnl);
+    println!("    5th–95th pct  : [{:.2}, {:.2}]", report.monte_carlo.pnl_5th, report.monte_carlo.pnl_95th);
+    println!("    P(profit)     : {:.1}%", report.monte_carlo.prob_profit);
+    println!("    Max DD (95th) : {:.2}", report.monte_carlo.max_drawdown_95th);
+
+    println!("\n  Expected Value:");
+    println!("    EV per trade  : {:.4} ({:.2}%)", report.expected_value.ev_per_trade, report.expected_value.ev_pct);
+    println!("    Breakeven WR  : {:.1}%", report.expected_value.breakeven_win_rate);
+    println!("    Actual WR     : {:.1}%", report.expected_value.actual_win_rate);
+    println!("    Edge over BE  : {:+.1}pp", report.expected_value.edge_over_breakeven);
+    println!("{}", "=".repeat(60));
 
     Ok(())
 }

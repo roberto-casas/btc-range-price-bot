@@ -113,6 +113,12 @@ pub struct BacktestTrade {
     pub won: bool,
     pub btc_at_expiry: f64,
     pub pnl: f64,
+    /// True if trade was closed by stop-loss before expiry
+    #[serde(default)]
+    pub stopped_out: bool,
+    /// True if trade was closed by take-profit before expiry
+    #[serde(default)]
+    pub took_profit_early: bool,
 }
 
 /// Aggregated backtest summary
@@ -125,6 +131,48 @@ pub struct BacktestSummary {
     pub total_pnl: f64,
     pub avg_profit_pct: f64,
     pub trades: Vec<BacktestTrade>,
+    /// Number of trades closed early by stop-loss
+    #[serde(default)]
+    pub stopped_out: usize,
+    /// Number of trades closed early by take-profit
+    #[serde(default)]
+    pub took_profit: usize,
+}
+
+/// Configuration for backtesting (all parameters in one place).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestConfig {
+    pub low_ratio: f64,
+    pub high_ratio: f64,
+    pub duration_days: i64,
+    pub yes_price_low: f64,
+    pub yes_price_high: f64,
+    /// Stop-loss: close trade if BTC moves this far outside the range (% of spot).
+    /// E.g. 0.15 = close if BTC drops 15% below low_threshold or rises 15% above high_threshold.
+    /// None = no stop-loss (hold to expiry).
+    pub stop_loss_pct: Option<f64>,
+    /// Take-profit: close trade early if unrealized profit exceeds this fraction
+    /// of max possible profit. E.g. 0.8 = take profit at 80% of max gain.
+    /// None = hold to expiry.
+    pub take_profit_pct: Option<f64>,
+    /// Data interval for sampling: "daily", "weekly", or "monthly".
+    /// Controls how frequently new trades are opened.
+    pub entry_interval: String,
+}
+
+impl Default for BacktestConfig {
+    fn default() -> Self {
+        Self {
+            low_ratio: 0.90,
+            high_ratio: 1.10,
+            duration_days: 7,
+            yes_price_low: 0.60,
+            yes_price_high: 0.70,
+            stop_loss_pct: None,
+            take_profit_pct: None,
+            entry_interval: "daily".to_string(),
+        }
+    }
 }
 
 /// A simulated order (dry-run mode)

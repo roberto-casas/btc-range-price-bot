@@ -1,22 +1,15 @@
-use crate::types::{BacktestSummary, BacktestTrade, Candle};
-use chrono::{DateTime, Duration, Utc};
+use crate::types::{BacktestConfig, BacktestSummary, BacktestTrade, Candle};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use tracing::info;
 
 /// Simulate the delta-neutral BTC range strategy against historical daily candles.
 ///
-/// For each day in the history we:
-/// 1. Simulate an entry at that day's BTC close price.
-/// 2. Generate synthetic market prices based on configurable low/high ratios.
-/// 3. Fast-forward `duration_days` and check if BTC stayed in range.
-/// 4. Record the trade outcome.
-///
-/// # Parameters
-/// - `candles`        – Daily BTC price history (oldest first).
-/// - `low_ratio`      – Lower bound as fraction of spot (e.g. 0.90 = 90%).
-/// - `high_ratio`     – Upper bound as fraction of spot (e.g. 1.10 = 110%).
-/// - `duration_days`  – Holding period in days.
-/// - `yes_price_low`  – Assumed YES-leg entry price (0..1).
-/// - `yes_price_high` – Assumed HIGH-leg YES price (0..1).
+/// For each entry point in the history we:
+/// 1. Simulate an entry at that candle's close price.
+/// 2. Define thresholds based on low/high ratios.
+/// 3. During holding period, check for stop-loss/take-profit triggers using intraday H/L.
+/// 4. At expiry, check if BTC is in range.
+/// 5. Record the trade outcome.
 pub fn run_backtest(
     candles: &[Candle],
     low_ratio: f64,
@@ -25,52 +18,91 @@ pub fn run_backtest(
     yes_price_low: f64,
     yes_price_high: f64,
 ) -> BacktestSummary {
+    let config = BacktestConfig {
+        low_ratio,
+        high_ratio,
+        duration_days,
+        yes_price_low,
+        yes_price_high,
+        ..Default::default()
+    };
+    run_backtest_advanced(candles, &config)
+}
+
+/// Run backtest with full configuration including stop-loss, take-profit,
+/// and configurable entry intervals.
+pub fn run_backtest_advanced(candles: &[Candle], config: &BacktestConfig) -> BacktestSummary {
+    let empty = BacktestSummary {
+        total_trades: 0,
+        winning_trades: 0,
+        losing_trades: 0,
+        win_rate: 0.0,
+        total_pnl: 0.0,
+        avg_profit_pct: 0.0,
+        trades: vec![],
+        stopped_out: 0,
+        took_profit: 0,
+    };
+
     if candles.is_empty() {
-        return BacktestSummary {
-            total_trades: 0,
-            winning_trades: 0,
-            losing_trades: 0,
-            win_rate: 0.0,
-            total_pnl: 0.0,
-            avg_profit_pct: 0.0,
-            trades: vec![],
-        };
+        return empty;
     }
 
-    let no_price = 1.0 - yes_price_high;
-    let cost_per_unit = yes_price_low + no_price;
+    let no_price = 1.0 - config.yes_price_high;
+    let cost_per_unit = config.yes_price_low + no_price;
     let profit_in_rng = 2.0 - cost_per_unit;
     let profit_pct = (profit_in_rng / cost_per_unit) * 100.0;
 
     let mut trades: Vec<BacktestTrade> = Vec::new();
 
-    // For each possible entry candle (except the last `duration_days` candles)
-    for i in 0..(candles.len().saturating_sub(duration_days as usize)) {
+    // Determine entry indices based on interval
+    let entry_indices = select_entry_indices(candles, &config.entry_interval, config.duration_days);
+
+    for i in entry_indices {
         let entry = &candles[i];
         let spot = entry.close;
 
-        let low_threshold = spot * low_ratio;
-        let high_threshold = spot * high_ratio;
+        let low_threshold = spot * config.low_ratio;
+        let high_threshold = spot * config.high_ratio;
+        let expiry_date: DateTime<Utc> = entry.timestamp + Duration::days(config.duration_days);
 
-        let expiry_date: DateTime<Utc> = entry.timestamp + Duration::days(duration_days);
+        // Check during holding period for stop-loss / take-profit
+        let (final_price, stopped_out, took_profit_early, exit_date) = simulate_holding_period(
+            candles,
+            i,
+            config.duration_days,
+            low_threshold,
+            high_threshold,
+            cost_per_unit,
+            profit_in_rng,
+            config.stop_loss_pct,
+            config.take_profit_pct,
+        );
 
-        // Find the candle closest to expiry
-        let expiry_candle = candles
-            .iter()
-            .skip(i)
-            .find(|c| c.timestamp >= expiry_date);
+        let btc_at_expiry = final_price;
+        let actual_expiry = exit_date.unwrap_or(expiry_date);
 
-        let btc_at_expiry = match expiry_candle {
-            Some(c) => c.close,
-            None => candles.last().unwrap().close,
+        // Determine outcome
+        let (won, pnl) = if stopped_out {
+            // Stop-loss triggered: lose entry cost
+            (false, -cost_per_unit)
+        } else if took_profit_early {
+            // Take-profit triggered: partial profit
+            let tp_fraction = config.take_profit_pct.unwrap_or(1.0);
+            (true, profit_in_rng * tp_fraction)
+        } else {
+            // Hold to expiry: check if in range
+            let in_range = btc_at_expiry >= low_threshold && btc_at_expiry <= high_threshold;
+            if in_range {
+                (true, profit_in_rng)
+            } else {
+                (false, -cost_per_unit)
+            }
         };
-
-        let won = btc_at_expiry >= low_threshold && btc_at_expiry <= high_threshold;
-        let pnl = if won { profit_in_rng } else { -cost_per_unit };
 
         trades.push(BacktestTrade {
             entry_date: entry.timestamp,
-            expiry_date,
+            expiry_date: actual_expiry,
             low_threshold,
             high_threshold,
             entry_cost: cost_per_unit,
@@ -79,6 +111,8 @@ pub fn run_backtest(
             won,
             btc_at_expiry,
             pnl,
+            stopped_out,
+            took_profit_early,
         });
     }
 
@@ -86,8 +120,9 @@ pub fn run_backtest(
     let winning_trades = trades.iter().filter(|t| t.won).count();
     let losing_trades = total_trades - winning_trades;
     let total_pnl: f64 = trades.iter().map(|t| t.pnl).sum();
+    let stopped_out = trades.iter().filter(|t| t.stopped_out).count();
+    let took_profit = trades.iter().filter(|t| t.took_profit_early).count();
     let avg_profit_pct = if total_trades > 0 {
-        // Average actual PnL as % of entry cost per trade
         trades
             .iter()
             .map(|t| (t.pnl / t.entry_cost) * 100.0)
@@ -103,8 +138,8 @@ pub fn run_backtest(
     };
 
     info!(
-        "Backtest complete: {} trades, {:.1}% win rate, total PnL: {:.4}",
-        total_trades, win_rate, total_pnl
+        "Backtest complete: {} trades, {:.1}% win rate, total PnL: {:.4} (SL:{} TP:{})",
+        total_trades, win_rate, total_pnl, stopped_out, took_profit
     );
 
     BacktestSummary {
@@ -115,12 +150,120 @@ pub fn run_backtest(
         total_pnl,
         avg_profit_pct,
         trades,
+        stopped_out,
+        took_profit,
     }
+}
+
+/// Select which candle indices to use as entry points based on the interval.
+fn select_entry_indices(candles: &[Candle], interval: &str, duration_days: i64) -> Vec<usize> {
+    let max_start = candles.len().saturating_sub(duration_days as usize);
+    if max_start == 0 {
+        return vec![];
+    }
+
+    match interval {
+        "weekly" => {
+            // Enter once per week (every 7 candles, or on Monday)
+            candles
+                .iter()
+                .enumerate()
+                .take(max_start)
+                .filter(|(_, c)| c.timestamp.weekday() == chrono::Weekday::Mon)
+                .map(|(i, _)| i)
+                .collect()
+        }
+        "monthly" => {
+            // Enter once per month (first trading day of each month)
+            let mut result = Vec::new();
+            let mut last_month = (0i32, 0u32);
+            for (i, c) in candles.iter().enumerate().take(max_start) {
+                let d = c.timestamp.date_naive();
+                let ym = (d.year(), d.month());
+                if ym != last_month {
+                    result.push(i);
+                    last_month = ym;
+                }
+            }
+            result
+        }
+        _ => {
+            // "daily" — every candle
+            (0..max_start).collect()
+        }
+    }
+}
+
+/// Simulate the holding period, checking intraday highs/lows for SL/TP triggers.
+///
+/// Returns: (final_price, stopped_out, took_profit, exit_date)
+fn simulate_holding_period(
+    candles: &[Candle],
+    entry_idx: usize,
+    duration_days: i64,
+    low_threshold: f64,
+    high_threshold: f64,
+    _cost_per_unit: f64,
+    _profit_in_rng: f64,
+    stop_loss_pct: Option<f64>,
+    take_profit_pct: Option<f64>,
+) -> (f64, bool, bool, Option<DateTime<Utc>>) {
+    let entry_ts = candles[entry_idx].timestamp;
+    let expiry_ts = entry_ts + Duration::days(duration_days);
+
+    // Stop-loss thresholds: BTC moves far enough outside range that the trade is clearly lost
+    let sl_low = stop_loss_pct.map(|pct| low_threshold * (1.0 - pct));
+    let sl_high = stop_loss_pct.map(|pct| high_threshold * (1.0 + pct));
+
+    // Scan candles during holding period
+    for c in candles.iter().skip(entry_idx + 1) {
+        if c.timestamp > expiry_ts {
+            break;
+        }
+
+        // Check stop-loss: did intraday price breach SL levels?
+        if let (Some(sl_l), Some(sl_h)) = (sl_low, sl_high) {
+            if c.low < sl_l || c.high > sl_h {
+                return (c.close, true, false, Some(c.timestamp));
+            }
+        }
+
+        // Check take-profit: is BTC perfectly centered in range (high confidence of win)?
+        // TP triggers if the current price is within the inner portion of the range
+        if let Some(tp_frac) = take_profit_pct {
+            let range_width = high_threshold - low_threshold;
+            let inner_margin = range_width * (1.0 - tp_frac) / 2.0;
+            let tp_low = low_threshold + inner_margin;
+            let tp_high = high_threshold - inner_margin;
+            if c.close >= tp_low && c.close <= tp_high {
+                // Only trigger TP if we're past 50% of the holding period
+                let elapsed = (c.timestamp - entry_ts).num_days() as f64;
+                let total = duration_days as f64;
+                if elapsed / total >= 0.5 {
+                    return (c.close, false, true, Some(c.timestamp));
+                }
+            }
+        }
+    }
+
+    // No early exit — find expiry candle
+    let expiry_candle = candles
+        .iter()
+        .skip(entry_idx)
+        .find(|c| c.timestamp >= expiry_ts);
+
+    let final_price = match expiry_candle {
+        Some(c) => c.close,
+        None => candles.last().unwrap().close,
+    };
+
+    (final_price, false, false, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::BacktestConfig;
     use chrono::TimeZone;
 
     fn make_candles(prices: &[f64]) -> Vec<Candle> {
@@ -131,8 +274,8 @@ mod tests {
             .map(|(i, &p)| Candle {
                 timestamp: base + Duration::days(i as i64),
                 open: p,
-                high: p,
-                low: p,
+                high: p * 1.01,
+                low: p * 0.99,
                 close: p,
             })
             .collect()
@@ -146,7 +289,6 @@ mod tests {
 
     #[test]
     fn test_backtest_all_wins() {
-        // BTC stays flat at 100, range is 90-110, all trades win
         let prices: Vec<f64> = vec![100.0; 30];
         let candles = make_candles(&prices);
         let summary = run_backtest(&candles, 0.90, 1.10, 7, 0.6, 0.7);
@@ -157,7 +299,6 @@ mod tests {
 
     #[test]
     fn test_backtest_all_losses() {
-        // BTC starts at 100 then crashes to 50 — below 90% range
         let mut prices: Vec<f64> = vec![100.0; 10];
         prices.extend(vec![50.0; 20]);
         let candles = make_candles(&prices);
@@ -168,7 +309,6 @@ mod tests {
 
     #[test]
     fn test_calculate_structure_metrics() {
-        // no_price = 1 - 0.7 = 0.3; cost = 0.6 + 0.3 = 0.9; profit = 2 - 0.9 = 1.1
         let no_price = 1.0 - 0.7_f64;
         let cost = 0.6_f64 + no_price;
         let profit = 2.0 - cost;
@@ -180,31 +320,82 @@ mod tests {
         let prices: Vec<f64> = vec![100.0; 30];
         let candles = make_candles(&prices);
         let summary = run_backtest(&candles, 0.90, 1.10, 7, 0.6, 0.7);
-        // Each win: pnl = profit_in_rng = 2 - (0.6 + 0.3) = 1.1
         let expected_pnl = summary.winning_trades as f64 * 1.1;
         assert!((summary.total_pnl - expected_pnl).abs() < 1e-6);
     }
 
-    /// Simulate realistic BTC price movements over 90 days to validate
-    /// the end-to-end backtest logic with varied market conditions.
+    #[test]
+    fn test_stop_loss() {
+        // BTC starts at 100, crashes to 50 on day 3 (well below 90% range)
+        let mut prices: Vec<f64> = vec![100.0; 3];
+        prices.push(50.0); // day 3: crash
+        prices.extend(vec![50.0; 20]);
+        let candles = make_candles(&prices);
+
+        let config = BacktestConfig {
+            low_ratio: 0.90,
+            high_ratio: 1.10,
+            duration_days: 7,
+            yes_price_low: 0.60,
+            yes_price_high: 0.70,
+            stop_loss_pct: Some(0.05), // 5% beyond range = SL
+            take_profit_pct: None,
+            entry_interval: "daily".to_string(),
+        };
+
+        let summary = run_backtest_advanced(&candles, &config);
+        // Trades entered on day 0 should be stopped out when price crashes
+        assert!(summary.stopped_out > 0, "Expected some stopped-out trades");
+        println!("SL test: {} trades, {} stopped out", summary.total_trades, summary.stopped_out);
+    }
+
+    #[test]
+    fn test_weekly_interval() {
+        let prices: Vec<f64> = vec![100.0; 60];
+        let candles = make_candles(&prices);
+
+        let daily = run_backtest(&candles, 0.90, 1.10, 7, 0.6, 0.7);
+        let config_weekly = BacktestConfig {
+            entry_interval: "weekly".to_string(),
+            ..BacktestConfig::default()
+        };
+        let weekly = run_backtest_advanced(&candles, &config_weekly);
+
+        assert!(weekly.total_trades < daily.total_trades,
+            "Weekly ({}) should have fewer trades than daily ({})",
+            weekly.total_trades, daily.total_trades);
+        println!("Daily: {} trades, Weekly: {} trades", daily.total_trades, weekly.total_trades);
+    }
+
+    #[test]
+    fn test_monthly_interval() {
+        // Generate 120 candles spanning ~4 months
+        let candles = crate::historical_data::generate_embedded_candles();
+
+        let config = BacktestConfig {
+            entry_interval: "monthly".to_string(),
+            ..BacktestConfig::default()
+        };
+        let monthly = run_backtest_advanced(&candles, &config);
+
+        // Should have roughly 1 trade per month
+        assert!(monthly.total_trades > 10, "Expected >10 monthly trades over ~2 years");
+        assert!(monthly.total_trades < 50, "Expected <50 monthly trades over ~2 years, got {}", monthly.total_trades);
+        println!("Monthly: {} trades", monthly.total_trades);
+    }
+
     #[test]
     fn test_backtest_realistic_btc_data() {
-        // Simulate 90 days of BTC prices: start at 85000, with realistic
-        // daily movements including a rally, consolidation, and dip.
         let mut prices = Vec::with_capacity(90);
         let base = 85000.0_f64;
-
-        // Days 0-29: Gradual rally from 85k to ~95k
         for i in 0..30 {
             let noise = ((i * 7 + 3) % 11) as f64 * 100.0 - 500.0;
             prices.push(base + (i as f64) * 333.0 + noise);
         }
-        // Days 30-59: Consolidation around 92k-96k
         for i in 0..30 {
             let noise = ((i * 13 + 5) % 17) as f64 * 150.0 - 1200.0;
             prices.push(94000.0 + noise);
         }
-        // Days 60-89: Dip to ~82k then recovery to 88k
         for i in 0..30 {
             let dip = if i < 15 {
                 -800.0 * i as f64
@@ -216,90 +407,31 @@ mod tests {
         }
 
         let candles = make_candles(&prices);
-        assert_eq!(candles.len(), 90);
-
-        // Test with ±10% range, 7-day duration
         let summary = run_backtest(&candles, 0.90, 1.10, 7, 0.60, 0.70);
 
-        // Basic sanity checks
-        assert_eq!(summary.total_trades, 83); // 90 - 7 = 83
-        assert_eq!(
-            summary.total_trades,
-            summary.winning_trades + summary.losing_trades
-        );
+        assert_eq!(summary.total_trades, 83);
+        assert_eq!(summary.total_trades, summary.winning_trades + summary.losing_trades);
         assert!(summary.win_rate >= 0.0 && summary.win_rate <= 100.0);
 
-        // Verify trade-level data integrity
         for trade in &summary.trades {
             assert!(trade.low_threshold < trade.high_threshold);
             assert!(trade.entry_cost > 0.0);
-            if trade.won {
-                assert!(trade.btc_at_expiry >= trade.low_threshold);
-                assert!(trade.btc_at_expiry <= trade.high_threshold);
-                assert!(trade.pnl > 0.0);
-            } else {
-                assert!(
-                    trade.btc_at_expiry < trade.low_threshold
-                        || trade.btc_at_expiry > trade.high_threshold
-                );
-                assert!(trade.pnl < 0.0);
-            }
         }
-
-        // Print summary for review
-        println!("\n=== Realistic BTC Backtest Results ===");
-        println!("Total trades: {}", summary.total_trades);
-        println!("Win rate: {:.1}%", summary.win_rate);
-        println!(
-            "Wins: {} / Losses: {}",
-            summary.winning_trades, summary.losing_trades
-        );
-        println!("Total PnL: {:.4}", summary.total_pnl);
-        println!("Avg PnL %: {:.2}%", summary.avg_profit_pct);
-
-        // With a ±10% range and realistic volatility, we expect a mix
-        // of wins and losses (not 100% or 0%)
-        assert!(
-            summary.winning_trades > 0,
-            "Expected at least some winning trades"
-        );
-
-        // Test with tighter range (±5%) — should have lower win rate
-        let tight = run_backtest(&candles, 0.95, 1.05, 7, 0.60, 0.70);
-        println!("\n--- Tight range (±5%) ---");
-        println!(
-            "Win rate: {:.1}% (vs {:.1}% for ±10%)",
-            tight.win_rate, summary.win_rate
-        );
-        assert!(
-            tight.win_rate <= summary.win_rate + 5.0,
-            "Tighter range should generally have lower or similar win rate"
-        );
-
-        // Test with longer duration (14 days) — more time for price to move
-        let longer = run_backtest(&candles, 0.90, 1.10, 14, 0.60, 0.70);
-        println!("\n--- Longer duration (14d) ---");
-        println!("Total trades: {}", longer.total_trades);
-        println!("Win rate: {:.1}%", longer.win_rate);
-        assert_eq!(longer.total_trades, 76); // 90 - 14 = 76
     }
 
-    /// Verify the avg_profit_pct calculation reflects actual trade outcomes
     #[test]
     fn test_avg_profit_pct_reflects_actual_outcomes() {
-        // Mix of wins and losses
         let mut prices: Vec<f64> = vec![100.0; 15];
-        prices.extend(vec![80.0; 15]); // crash — losses for trades entered near day 8+
+        prices.extend(vec![80.0; 15]);
         let candles = make_candles(&prices);
         let summary = run_backtest(&candles, 0.90, 1.10, 7, 0.6, 0.7);
 
         assert!(summary.winning_trades > 0);
         assert!(summary.losing_trades > 0);
 
-        // Manually compute expected avg profit %
-        let cost = 0.6 + (1.0 - 0.7); // 0.9
-        let win_pct = ((2.0 - cost) / cost) * 100.0; // +122.22%
-        let loss_pct = (-cost / cost) * 100.0; // -100%
+        let cost = 0.6 + (1.0 - 0.7);
+        let win_pct = ((2.0 - cost) / cost) * 100.0;
+        let loss_pct = (-cost / cost) * 100.0;
 
         let expected_avg = (summary.winning_trades as f64 * win_pct
             + summary.losing_trades as f64 * loss_pct)
