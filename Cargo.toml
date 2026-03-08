@@ -1,0 +1,55 @@
+[package]
+name = "btc-range-price-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Delta-neutral BTC range strategy finder for Polymarket, adapted from polydelta"
+license = "MIT"
+
+[[bin]]
+name = "polydelta"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Web server (dashboard)
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Regex
+regex = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Futures utilities
+futures-util = "0.3"
+
+# URL utilities
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
