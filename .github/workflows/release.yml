@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          BIN_NAME=$(cargo metadata --no-deps --format-version 1 | \
+            python3 -c "import sys,json; m=json.load(sys.stdin); print(next(t['name'] for p in m['packages'] for t in p['targets'] if 'bin' in t['kind']))")
+          ARCHIVE="${BIN_NAME}-${TAG}-linux-x86_64.tar.gz"
+          tar -czf "${ARCHIVE}" -C target/release "${BIN_NAME}"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: ${{ env.ARCHIVE }}
