@@ -12,6 +12,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::backtesting::run_backtest;
+use crate::db::Db;
 use crate::scanner::fetch_historical_btc;
 use crate::types::ScanResult;
 
@@ -20,13 +21,17 @@ use crate::types::ScanResult;
 pub struct AppState {
     pub scan_result: Arc<RwLock<Option<ScanResult>>>,
     pub http_client: reqwest::Client,
+    pub db: Arc<Db>,
+    pub dry_run: bool,
 }
 
 impl AppState {
-    pub fn new(http_client: reqwest::Client) -> Self {
+    pub fn new(http_client: reqwest::Client, db: Arc<Db>, dry_run: bool) -> Self {
         Self {
             scan_result: Arc::new(RwLock::new(None)),
             http_client,
+            db,
+            dry_run,
         }
     }
 }
@@ -38,6 +43,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/data", get(data_handler))
         .route("/api/health", get(health_handler))
         .route("/api/backtest", get(backtest_handler))
+        .route("/api/portfolio", get(portfolio_handler))
+        .route("/api/orders", get(orders_handler))
+        .route("/api/price-history", get(price_history_handler))
+        .route("/api/snapshots", get(snapshots_handler))
         .with_state(state)
         .layer(CorsLayer::permissive())
 }
@@ -113,6 +122,72 @@ async fn backtest_handler(
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": format!("Failed to fetch historical data: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Return current portfolio summary (computed from DB)
+async fn portfolio_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.dry_run {
+        return Json(serde_json::json!({
+            "error": "Portfolio tracking is only available in dry-run mode"
+        }))
+        .into_response();
+    }
+
+    match state.db.get_latest_snapshot() {
+        Ok(Some(snap)) => Json(serde_json::to_value(snap).unwrap_or_default()).into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "balance": 0,
+            "total_invested": 0,
+            "total_pnl": 0,
+            "open_positions": 0,
+            "closed_positions": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "message": "No portfolio data yet. Waiting for first scan cycle."
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Return all simulated orders (newest first)
+async fn orders_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.get_all_orders() {
+        Ok(orders) => Json(serde_json::to_value(orders).unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Return recent BTC price observations
+async fn price_history_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.get_recent_prices(200) {
+        Ok(prices) => Json(serde_json::to_value(prices).unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Return all portfolio snapshots (for charting equity curve)
+async fn snapshots_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.get_all_snapshots() {
+        Ok(snaps) => Json(serde_json::to_value(snaps).unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB error: {e}") })),
         )
             .into_response(),
     }
@@ -392,6 +467,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <div class="tabs">
       <button class="tab-btn active" onclick="showTab('scanner')">📊 Scanner</button>
       <button class="tab-btn" onclick="showTab('backtest')">📈 Backtesting</button>
+      <button class="tab-btn" onclick="showTab('portfolio')" id="tab-btn-portfolio" style="display:none;">💼 Portfolio</button>
     </div>
 
     <!-- Scanner tab -->
@@ -462,6 +538,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       </div>
       <div id="backtest-results"></div>
     </div>
+
+    <!-- Portfolio tab (dry-run only) -->
+    <div class="tab-panel" id="tab-portfolio">
+      <div id="portfolio-content">
+        <div class="message"><div class="icon">⏳</div><p>Loading portfolio data...</p></div>
+      </div>
+    </div>
   </main>
 
   <script>
@@ -480,7 +563,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const data = await resp.json();
         allPairs = data.pairs || [];
         updateBaseUI(data.btc_price, data.generated_at);
-        if (data.dry_run) document.getElementById('dry-run-banner').style.display = 'block';
+        if (data.dry_run) {
+          document.getElementById('dry-run-banner').style.display = 'block';
+          document.getElementById('tab-btn-portfolio').style.display = '';
+          loadPortfolio();
+        }
+        if (data.ai_assessment) renderAiAssessment(data.ai_assessment);
         populateMonthFilters();
         updateSortUI();
         renderPairs();
@@ -670,6 +758,103 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
     function fmt(n) { return Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 }); }
     function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    // ── Portfolio (dry-run) ────────────────────────────────
+    async function loadPortfolio() {
+      try {
+        const [portResp, ordersResp] = await Promise.all([
+          fetch('/api/portfolio'),
+          fetch('/api/orders')
+        ]);
+        const portfolio = await portResp.json();
+        const orders = await ordersResp.json();
+        renderPortfolio(portfolio, orders);
+      } catch (e) {
+        document.getElementById('portfolio-content').innerHTML =
+          `<div class="message"><div class="icon">⚠️</div><p>${esc(e.message)}</p></div>`;
+      }
+    }
+
+    function renderPortfolio(p, orders) {
+      const pnlClass = (p.total_pnl || 0) >= 0 ? 'green' : 'red';
+      const wrPct = (p.win_count + p.loss_count) > 0
+        ? ((p.win_count / (p.win_count + p.loss_count)) * 100).toFixed(1)
+        : '0.0';
+      const wrClass = parseFloat(wrPct) >= 50 ? 'green' : 'red';
+
+      const openOrders = Array.isArray(orders) ? orders.filter(o => o.status === 'open') : [];
+      const closedOrders = Array.isArray(orders) ? orders.filter(o => o.status !== 'open') : [];
+
+      let html = `
+        <div class="bt-summary">
+          <div class="bt-stat"><div class="bt-stat-label">Balance</div><div class="bt-stat-value">$${(p.balance||0).toFixed(2)}</div></div>
+          <div class="bt-stat"><div class="bt-stat-label">Total Invested</div><div class="bt-stat-value">$${(p.total_invested||0).toFixed(2)}</div></div>
+          <div class="bt-stat"><div class="bt-stat-label">Total PnL</div><div class="bt-stat-value ${pnlClass}">${(p.total_pnl||0) >= 0 ? '+' : ''}$${(p.total_pnl||0).toFixed(2)}</div></div>
+          <div class="bt-stat"><div class="bt-stat-label">Open Positions</div><div class="bt-stat-value yellow">${p.open_positions||0}</div></div>
+          <div class="bt-stat"><div class="bt-stat-label">Win Rate</div><div class="bt-stat-value ${wrClass}">${wrPct}%</div></div>
+          <div class="bt-stat"><div class="bt-stat-label">W / L</div><div class="bt-stat-value"><span class="green">${p.win_count||0}</span> / <span class="red">${p.loss_count||0}</span></div></div>
+        </div>`;
+
+      if (openOrders.length > 0) {
+        html += `<h3 style="margin:16px 0 8px;font-size:14px;color:var(--yellow);">Open Positions (${openOrders.length})</h3>`;
+        html += renderOrdersTable(openOrders);
+      }
+
+      if (closedOrders.length > 0) {
+        html += `<h3 style="margin:16px 0 8px;font-size:14px;color:var(--muted);">Closed Positions (${closedOrders.length})</h3>`;
+        html += renderOrdersTable(closedOrders.slice(0, 50));
+        if (closedOrders.length > 50) {
+          html += `<p style="color:var(--muted);font-size:12px;margin-top:8px;">Showing first 50 of ${closedOrders.length} closed orders.</p>`;
+        }
+      }
+
+      if (openOrders.length === 0 && closedOrders.length === 0) {
+        html += `<div class="message" style="padding:40px 0"><div class="icon">📭</div><p>No simulated orders yet. Waiting for scanner to find pairs...</p></div>`;
+      }
+
+      document.getElementById('portfolio-content').innerHTML = html;
+    }
+
+    function renderOrdersTable(orders) {
+      return `<div style="overflow-x:auto;"><table class="bt-trades-table">
+        <thead><tr>
+          <th>Date</th><th>Pair</th><th>Leg</th><th>Price</th>
+          <th>Units</th><th>Cost</th><th>BTC</th><th>Status</th><th>PnL</th>
+        </tr></thead>
+        <tbody>${orders.map(o => `<tr>
+          <td>${new Date(o.created_at).toLocaleDateString()}</td>
+          <td>${esc(o.pair_label)}</td>
+          <td>${esc(o.leg)}</td>
+          <td>${o.price.toFixed(4)}</td>
+          <td>${o.units.toFixed(2)}</td>
+          <td>$${o.cost.toFixed(2)}</td>
+          <td>$${fmt(o.btc_price)}</td>
+          <td class="${o.status==='won'?'won-yes':o.status==='lost'?'won-no':''}">${o.status.toUpperCase()}</td>
+          <td class="${o.pnl>=0?'won-yes':'won-no'}">${o.pnl!==0?(o.pnl>=0?'+':'')+o.pnl.toFixed(2):'—'}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`;
+    }
+
+    // ── AI Risk Assessment ───────────────────────────────
+    function renderAiAssessment(ai) {
+      if (!ai) return;
+      const colors = { low: 'var(--green)', medium: 'var(--yellow)', high: 'var(--red)', extreme: 'var(--red)' };
+      const color = colors[ai.risk_level] || 'var(--muted)';
+      const el = document.createElement('div');
+      el.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px;';
+      el.innerHTML = `
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+          <span style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;">AI Risk Advisor</span>
+          <span style="background:${color}22;border:1px solid ${color}44;color:${color};font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;text-transform:uppercase;">${esc(ai.risk_level)}</span>
+          <span style="font-size:12px;color:var(--muted);">Confidence: ${(ai.confidence*100).toFixed(0)}%</span>
+          ${ai.skip_trade ? '<span style="background:var(--red)22;border:1px solid var(--red)44;color:var(--red);font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;">SKIP RECOMMENDED</span>' : ''}
+        </div>
+        <div style="font-size:12px;color:var(--text);margin-bottom:6px;">${esc(ai.reasoning)}</div>
+        ${ai.risk_factors && ai.risk_factors.length ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">Risk factors: ' + ai.risk_factors.map(f => esc(f)).join(' · ') + '</div>' : ''}
+        ${ai.suggested_low_adjust_pct || ai.suggested_high_adjust_pct ? '<div style="font-size:11px;color:var(--blue);margin-top:4px;">Suggested range adjust: low ' + (ai.suggested_low_adjust_pct >= 0 ? '+' : '') + ai.suggested_low_adjust_pct.toFixed(1) + '% / high ' + (ai.suggested_high_adjust_pct >= 0 ? '+' : '') + ai.suggested_high_adjust_pct.toFixed(1) + '%</div>' : ''}`;
+      const scannerTab = document.getElementById('tab-scanner');
+      scannerTab.insertBefore(el, scannerTab.firstChild);
+    }
 
     // Auto-refresh every 60 seconds
     loadData();

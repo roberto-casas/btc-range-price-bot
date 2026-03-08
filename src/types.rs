@@ -88,6 +88,9 @@ pub struct ScanResult {
     pub btc_price: f64,
     pub pairs: Vec<OutputPair>,
     pub dry_run: bool,
+    /// AI risk assessment for the top pair (if OpenAI advisor is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_assessment: Option<crate::ai_advisor::RiskAssessment>,
 }
 
 /// A historical candle / OHLC data point for backtesting

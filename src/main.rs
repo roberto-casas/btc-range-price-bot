@@ -1,12 +1,16 @@
+mod ai_advisor;
 mod analytics;
 mod backtesting;
 mod config;
 mod dashboard;
+mod db;
 mod dry_run;
 mod historical_data;
 mod polymarket_ws;
 mod scanner;
 mod types;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -16,6 +20,7 @@ use tracing::{error, info, warn};
 
 use config::load_config;
 use dashboard::AppState;
+use db::Db;
 use scanner::{calculate_structure, fetch_historical_btc, find_best_pairs, get_btc_price};
 use types::{OutputPair, ScanResult};
 
@@ -70,6 +75,10 @@ enum Command {
         /// Scan interval in seconds (0 = scan once and exit)
         #[arg(long)]
         interval: Option<u64>,
+
+        /// Path to the SQLite database for persistent dry-run state
+        #[arg(long, default_value = db::DEFAULT_DB_PATH)]
+        db_path: String,
     },
 
     /// Run a historical backtest of the strategy
@@ -151,6 +160,7 @@ async fn main() -> Result<()> {
             balance,
             live,
             interval,
+            db_path,
         } => {
             let scan_defaults = app_config.scan;
             let resolved_timeframe = timeframe.unwrap_or(scan_defaults.timeframe);
@@ -168,6 +178,7 @@ async fn main() -> Result<()> {
                 resolved_balance,
                 resolved_live,
                 resolved_interval,
+                db_path,
             )
             .await?;
         }
@@ -232,12 +243,29 @@ async fn run_scan(
     balance: f64,
     live: bool,
     interval: u64,
+    db_path: String,
 ) -> Result<()> {
     if dry_run {
-        warn!("🟡 DRY-RUN MODE enabled — no real orders will be placed");
+        warn!("DRY-RUN MODE enabled — no real orders will be placed");
     }
 
-    let state = AppState::new(http.clone());
+    // Open (or create) the SQLite database for persistent dry-run state
+    let database = Arc::new(Db::open(std::path::Path::new(&db_path))?);
+
+    if dry_run {
+        // Report persisted state from previous runs
+        let orders = database.get_all_orders()?;
+        let open_count = orders.iter().filter(|o| o.status == "open").count();
+        let closed_count = orders.iter().filter(|o| o.status != "open").count();
+        info!(
+            "DB loaded: {} total orders ({} open, {} settled)",
+            orders.len(),
+            open_count,
+            closed_count
+        );
+    }
+
+    let state = AppState::new(http.clone(), database.clone(), dry_run);
     let shared_result = state.scan_result.clone();
 
     // Start dashboard server in background
@@ -252,7 +280,7 @@ async fn run_scan(
     let (ws_tx, mut ws_rx) = broadcast::channel::<polymarket_ws::PriceUpdate>(256);
 
     if live {
-        info!("📡 Starting Polymarket WebSocket price feed...");
+        info!("Starting Polymarket WebSocket price feed...");
         let tx = ws_tx.clone();
         tokio::spawn(async move {
             // We subscribe to all markets after the first scan — start with empty list.
@@ -268,7 +296,7 @@ async fn run_scan(
                 match ws_rx.recv().await {
                     Ok(update) => {
                         info!(
-                            "💹 [WS] token={} price={:.4} side={}",
+                            "[WS] token={} price={:.4} side={}",
                             &update.token_id[..8.min(update.token_id.len())],
                             update.price,
                             update.side
@@ -283,13 +311,18 @@ async fn run_scan(
         });
     }
 
+    // Check for AI advisor availability
+    if ai_advisor::is_available() {
+        info!("OpenAI AI advisor is enabled (OPENAI_API_KEY detected)");
+    }
+
     // Scan loop
     loop {
-        info!("🔍 Scanning Polymarket... (timeframe={})", timeframe);
+        info!("Scanning Polymarket... (timeframe={})", timeframe);
 
         let btc_price = match get_btc_price(&http).await {
             Ok(p) => {
-                info!("₿  BTC/USD: ${p:.0}");
+                info!("BTC/USD: ${p:.0}");
                 p
             }
             Err(e) => {
@@ -301,6 +334,20 @@ async fn run_scan(
                 continue;
             }
         };
+
+        // Record price in DB
+        if let Err(e) = database.insert_price(btc_price) {
+            warn!("Failed to record BTC price in DB: {e}");
+        }
+
+        // Settle any expired orders
+        if dry_run {
+            match database.settle_expired_orders(btc_price) {
+                Ok(n) if n > 0 => info!("[DRY-RUN] Settled {n} expired position(s)"),
+                Err(e) => warn!("Failed to settle expired orders: {e}"),
+                _ => {}
+            }
+        }
 
         let pairs = match find_best_pairs(&http, btc_price, &timeframe).await {
             Ok(p) => p,
@@ -314,7 +361,15 @@ async fn run_scan(
             }
         };
 
-        info!("✅ Found {} delta-neutral pairs", pairs.len());
+        info!("Found {} delta-neutral pairs", pairs.len());
+
+        // Collect recent prices for AI advisor context
+        let recent_prices: Vec<f64> = database
+            .get_recent_prices(14)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.btc_price)
+            .collect();
 
         let output_pairs: Vec<OutputPair> = pairs
             .iter()
@@ -326,7 +381,7 @@ async fn run_scan(
                 let low_pct = (low.threshold / btc_price - 1.0) * 100.0;
                 let high_pct = (high.threshold / btc_price - 1.0) * 100.0;
 
-                // In dry-run mode: print the simulated orders to stdout
+                // In dry-run mode: simulate and persist the orders
                 if dry_run {
                     let no_token = low.no_token_id.as_deref().unwrap_or("unknown_no_token");
                     const THOUSAND: f64 = 1000.0;
@@ -335,13 +390,17 @@ async fn run_scan(
                         low.threshold / THOUSAND,
                         high.threshold / THOUSAND
                     );
-                    dry_run::simulate_pair_entry(
+                    let expiry = low.end_date.to_rfc3339();
+                    dry_run::simulate_pair_entry_persistent(
+                        &database,
                         &label,
                         &low.yes_token_id,
                         no_token,
                         p.yes_price_low,
                         calc.no_price,
                         balance,
+                        btc_price,
+                        &expiry,
                     );
                 }
 
@@ -372,25 +431,60 @@ async fn run_scan(
             })
             .collect();
 
+        // Run AI advisor if available (for the best pair)
+        let ai_assessment = if ai_advisor::is_available() && !output_pairs.is_empty() {
+            let best = &output_pairs[0];
+            let ctx = ai_advisor::AdvisorContext {
+                btc_price,
+                proposed_low_threshold: best.low_threshold,
+                proposed_high_threshold: best.high_threshold,
+                low_pct_from_spot: best.low_pct,
+                high_pct_from_spot: best.high_pct,
+                days_until_expiry: best.days_until,
+                profit_pct: best.profit_pct,
+                recent_prices: recent_prices.clone(),
+                daily_volatility_pct: None,
+                atr_14_pct: None,
+            };
+            Some(ai_advisor::assess_risk(&http, &ctx).await)
+        } else {
+            None
+        };
+
+        // Save portfolio snapshot in dry-run mode
+        if dry_run {
+            if let Ok(snap) = database.compute_snapshot(btc_price, balance * 10.0) {
+                if let Err(e) = database.insert_snapshot(&snap) {
+                    warn!("Failed to save portfolio snapshot: {e}");
+                }
+                info!(
+                    "[DRY-RUN] Portfolio: balance={:.2} invested={:.2} pnl={:.2} open={} won={} lost={}",
+                    snap.balance, snap.total_invested, snap.total_pnl,
+                    snap.open_positions, snap.win_count, snap.loss_count
+                );
+            }
+        }
+
         let result = ScanResult {
             generated_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             btc_price,
             pairs: output_pairs,
             dry_run,
+            ai_assessment,
         };
 
         *shared_result.write().await = Some(result);
-        info!("📊 Dashboard data updated");
+        info!("Dashboard data updated");
 
         if interval == 0 {
-            info!("🌐 Dashboard: http://127.0.0.1:{port}/");
+            info!("Dashboard: http://127.0.0.1:{port}/");
             info!("   Press Ctrl+C to stop.");
             // Keep the server running
             tokio::signal::ctrl_c().await?;
             break;
         }
 
-        info!("⏳ Next scan in {interval}s...");
+        info!("Next scan in {interval}s...");
         tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
     }
 
@@ -414,7 +508,7 @@ async fn run_backtest_cli(
     entry_interval: String,
 ) -> Result<()> {
     info!(
-        "📈 Running backtest: range=[{:.0}%–{:.0}%], duration={}d, interval={}",
+        "Running backtest: range=[{:.0}%–{:.0}%], duration={}d, interval={}",
         low_ratio * 100.0,
         high_ratio * 100.0,
         duration_days,
@@ -482,7 +576,7 @@ async fn run_backtest_cli(
                 t.high_threshold,
                 t.btc_at_expiry,
                 t.pnl,
-                if t.won { "✓ WIN" } else { "✗ LOSS" },
+                if t.won { "WIN" } else { "LOSS" },
             );
         }
     }
