@@ -60,6 +60,10 @@ enum Command {
         #[arg(long)]
         timeframe: Option<String>,
 
+        /// Host address to bind the web dashboard (e.g. 0.0.0.0 for all interfaces)
+        #[arg(long)]
+        host: Option<String>,
+
         /// Port for the web dashboard
         #[arg(long)]
         port: Option<u16>,
@@ -171,6 +175,7 @@ async fn main() -> Result<()> {
         Command::Scan {
             dry_run,
             timeframe,
+            host,
             port,
             balance,
             live,
@@ -179,6 +184,7 @@ async fn main() -> Result<()> {
         } => {
             let scan_defaults = app_config.scan;
             let resolved_timeframe = timeframe.unwrap_or(scan_defaults.timeframe);
+            let resolved_host = host.unwrap_or(scan_defaults.host);
             let resolved_port = port.unwrap_or(scan_defaults.port);
             let resolved_balance = balance.unwrap_or(scan_defaults.balance);
             let resolved_interval = interval.unwrap_or(scan_defaults.interval);
@@ -189,6 +195,7 @@ async fn main() -> Result<()> {
                 http,
                 resolved_dry_run,
                 resolved_timeframe,
+                resolved_host,
                 resolved_port,
                 resolved_balance,
                 resolved_live,
@@ -265,6 +272,7 @@ async fn run_scan(
     http: reqwest::Client,
     dry_run: bool,
     timeframe: String,
+    host: String,
     port: u16,
     balance: f64,
     live: bool,
@@ -297,7 +305,7 @@ async fn run_scan(
     // Start dashboard server in background
     let server_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = dashboard::start_server(server_state, port).await {
+        if let Err(e) = dashboard::start_server(server_state, &host, port).await {
             error!("Dashboard server error: {e}");
         }
     });
