@@ -18,5 +18,10 @@ nohup.out
 # Generated data (Python original)
 data.js
 
+# SQLite runtime databases
+*.db
+*.db-shm
+*.db-wal
+
 # Environment
 .env
