@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 
 use config::load_config;
@@ -312,14 +312,14 @@ async fn run_scan(
 
     // Optionally start WebSocket price feed
     let (ws_tx, mut ws_rx) = broadcast::channel::<polymarket_ws::PriceUpdate>(256);
+    // Watch channel for dynamically updating the token subscription list
+    let (ws_token_tx, ws_token_rx) = watch::channel::<Vec<String>>(vec![]);
 
     if live {
         info!("Starting Polymarket WebSocket price feed...");
         let tx = ws_tx.clone();
         tokio::spawn(async move {
-            // We subscribe to all markets after the first scan — start with empty list.
-            // In a production system this would be updated dynamically.
-            if let Err(e) = polymarket_ws::start_ws_listener(vec![], tx).await {
+            if let Err(e) = polymarket_ws::start_ws_listener(ws_token_rx, tx).await {
                 error!("WebSocket listener error: {e}");
             }
         });
@@ -396,6 +396,32 @@ async fn run_scan(
         };
 
         info!("Found {} delta-neutral pairs", pairs.len());
+
+        // Update WebSocket subscriptions with discovered token IDs
+        if live {
+            let mut token_ids: Vec<String> = pairs
+                .iter()
+                .flat_map(|p| {
+                    let mut ids = vec![
+                        p.low_market.yes_token_id.clone(),
+                        p.high_market.yes_token_id.clone(),
+                    ];
+                    if let Some(ref no_id) = p.low_market.no_token_id {
+                        ids.push(no_id.clone());
+                    }
+                    if let Some(ref no_id) = p.high_market.no_token_id {
+                        ids.push(no_id.clone());
+                    }
+                    ids
+                })
+                .collect();
+            token_ids.sort();
+            token_ids.dedup();
+            if !token_ids.is_empty() {
+                info!("Updating WebSocket subscriptions with {} tokens", token_ids.len());
+                let _ = ws_token_tx.send(token_ids);
+            }
+        }
 
         // Collect recent prices for AI advisor context
         let recent_prices: Vec<f64> = database
