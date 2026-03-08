@@ -14,8 +14,11 @@ const COINGECKO_HISTORY_URL: &str =
     "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart";
 
 // ── Strategy configuration ─────────────────────────────────────────────────────
-const LOW_RANGE: (f64, f64) = (0.80, 0.97);
-const HIGH_RANGE: (f64, f64) = (1.03, 1.25);
+/// Scanner qualification ranges (tightened based on backtest: 92-108% optimal).
+/// LOW leg: markets with threshold 85%-96% of spot price.
+/// HIGH leg: markets with threshold 104%-116% of spot price.
+const LOW_RANGE: (f64, f64) = (0.85, 0.96);
+const HIGH_RANGE: (f64, f64) = (1.04, 1.16);
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 
 // ── Internal deserialization helpers ──────────────────────────────────────────

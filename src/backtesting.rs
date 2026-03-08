@@ -24,7 +24,9 @@ pub fn run_backtest(
         duration_days,
         yes_price_low,
         yes_price_high,
-        ..Default::default()
+        stop_loss_pct: None,
+        take_profit_pct: None,
+        entry_interval: "daily".to_string(),
     };
     run_backtest_advanced(candles, &config)
 }
@@ -356,8 +358,14 @@ mod tests {
 
         let daily = run_backtest(&candles, 0.90, 1.10, 7, 0.6, 0.7);
         let config_weekly = BacktestConfig {
+            low_ratio: 0.90,
+            high_ratio: 1.10,
+            duration_days: 7,
+            yes_price_low: 0.60,
+            yes_price_high: 0.70,
+            stop_loss_pct: None,
+            take_profit_pct: None,
             entry_interval: "weekly".to_string(),
-            ..BacktestConfig::default()
         };
         let weekly = run_backtest_advanced(&candles, &config_weekly);
 
@@ -373,8 +381,14 @@ mod tests {
         let candles = crate::historical_data::generate_embedded_candles();
 
         let config = BacktestConfig {
+            low_ratio: 0.90,
+            high_ratio: 1.10,
+            duration_days: 7,
+            yes_price_low: 0.60,
+            yes_price_high: 0.70,
+            stop_loss_pct: None,
+            take_profit_pct: None,
             entry_interval: "monthly".to_string(),
-            ..BacktestConfig::default()
         };
         let monthly = run_backtest_advanced(&candles, &config);
 

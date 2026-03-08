@@ -68,12 +68,12 @@ enum Command {
 
     /// Run a historical backtest of the strategy
     Backtest {
-        /// Lower price bound as % of BTC spot (e.g. 90 = 90%)
-        #[arg(long, default_value_t = 90.0)]
+        /// Lower price bound as % of BTC spot (e.g. 92 = 92%)
+        #[arg(long, default_value_t = 92.0)]
         low_pct: f64,
 
-        /// Upper price bound as % of BTC spot (e.g. 110 = 110%)
-        #[arg(long, default_value_t = 110.0)]
+        /// Upper price bound as % of BTC spot (e.g. 108 = 108%)
+        #[arg(long, default_value_t = 108.0)]
         high_pct: f64,
 
         /// Trade duration in days
@@ -81,11 +81,11 @@ enum Command {
         duration_days: i64,
 
         /// Assumed YES-leg entry price (0..1)
-        #[arg(long, default_value_t = 0.60)]
+        #[arg(long, default_value_t = 0.55)]
         yes_price_low: f64,
 
         /// Assumed HIGH-leg YES entry price (0..1)
-        #[arg(long, default_value_t = 0.70)]
+        #[arg(long, default_value_t = 0.65)]
         yes_price_high: f64,
 
         /// Number of days of historical BTC data to fetch (ignored with --offline or --csv)
@@ -102,16 +102,18 @@ enum Command {
 
         /// Stop-loss: close trade if BTC moves this % beyond the range thresholds.
         /// E.g. 5 = close if BTC drops 5% below low or rises 5% above high.
-        #[arg(long)]
+        /// Default: 5. Use --stop-loss 0 to disable.
+        #[arg(long, default_value = "5")]
         stop_loss: Option<f64>,
 
         /// Take-profit: close early when BTC is within this fraction of the range center.
         /// E.g. 80 = take profit when 80% confident (past 50% of holding period).
-        #[arg(long)]
+        /// Default: 80. Use --take-profit 0 to disable.
+        #[arg(long, default_value = "80")]
         take_profit: Option<f64>,
 
         /// Entry interval: "daily", "weekly", or "monthly"
-        #[arg(long, default_value = "daily")]
+        #[arg(long, default_value = "weekly")]
         interval: String,
     },
 }
@@ -156,6 +158,9 @@ async fn main() -> Result<()> {
             take_profit,
             interval,
         } => {
+            // Convert % to ratio; 0 disables the feature
+            let sl = stop_loss.filter(|&v| v > 0.0).map(|v| v / 100.0);
+            let tp = take_profit.filter(|&v| v > 0.0).map(|v| v / 100.0);
             run_backtest_cli(
                 http,
                 low_pct / 100.0,
@@ -166,8 +171,8 @@ async fn main() -> Result<()> {
                 history_days,
                 offline,
                 csv,
-                stop_loss.map(|v| v / 100.0),
-                take_profit.map(|v| v / 100.0),
+                sl,
+                tp,
                 interval,
             )
             .await?;
