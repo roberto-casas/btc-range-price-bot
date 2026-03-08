@@ -230,10 +230,10 @@ async fn main() -> Result<()> {
             let sl = (stop_loss_value > 0.0).then(|| stop_loss_value / 100.0);
             let tp = (take_profit_value > 0.0).then(|| take_profit_value / 100.0);
 
-            // Convert cost % to fractions
-            let spread_frac = spread.map(|s| s / 100.0);
-            let fee_frac = fee.map(|f| f / 100.0);
-            let slippage_frac = slippage.map(|s| s / 100.0);
+            // Convert cost % to fractions (use config defaults if not provided via CLI)
+            let spread_frac = Some(spread.unwrap_or(backtest_defaults.spread) / 100.0);
+            let fee_frac = Some(fee.unwrap_or(backtest_defaults.fee) / 100.0);
+            let slippage_frac = Some(slippage.unwrap_or(backtest_defaults.slippage) / 100.0);
 
             run_backtest_cli(
                 http,

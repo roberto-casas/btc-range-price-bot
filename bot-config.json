@@ -8,14 +8,14 @@
     "live": false
   },
   "backtest": {
-    "low_pct": 92.0,
-    "high_pct": 108.0,
+    "low_pct": 88.0,
+    "high_pct": 112.0,
     "duration_days": 7,
-    "yes_price_low": 0.55,
-    "yes_price_high": 0.65,
+    "yes_price_low": 0.85,
+    "yes_price_high": 0.15,
     "history_days": 90,
     "stop_loss": 5.0,
-    "take_profit": 80.0,
+    "take_profit": 0.0,
     "interval": "weekly",
     "offline": false
   }

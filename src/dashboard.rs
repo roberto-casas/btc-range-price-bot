@@ -93,11 +93,11 @@ async fn backtest_handler(
     Query(params): Query<BacktestQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let low_ratio = params.low_ratio.unwrap_or(0.90).clamp(0.50, 0.99);
-    let high_ratio = params.high_ratio.unwrap_or(1.10).clamp(1.01, 2.00);
+    let low_ratio = params.low_ratio.unwrap_or(0.88).clamp(0.50, 0.99);
+    let high_ratio = params.high_ratio.unwrap_or(1.12).clamp(1.01, 2.00);
     let duration = params.duration.unwrap_or(7).clamp(1, 90);
-    let yes_price_low = params.yes_price_low.unwrap_or(0.60).clamp(0.01, 0.99);
-    let yes_price_high = params.yes_price_high.unwrap_or(0.70).clamp(0.01, 0.99);
+    let yes_price_low = params.yes_price_low.unwrap_or(0.85).clamp(0.01, 0.99);
+    let yes_price_high = params.yes_price_high.unwrap_or(0.15).clamp(0.01, 0.99);
     let history_days = params.history_days.unwrap_or(90).clamp(7, 365);
 
     if low_ratio >= high_ratio {
@@ -554,11 +554,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <div class="form-row">
           <div class="form-group">
             <label>Low Ratio (%)</label>
-            <input type="number" id="bt-low-ratio" value="90" min="50" max="99" step="1" />
+            <input type="number" id="bt-low-ratio" value="88" min="50" max="99" step="1" />
           </div>
           <div class="form-group">
             <label>High Ratio (%)</label>
-            <input type="number" id="bt-high-ratio" value="110" min="101" max="200" step="1" />
+            <input type="number" id="bt-high-ratio" value="112" min="101" max="200" step="1" />
           </div>
         </div>
         <div class="form-row">
@@ -568,11 +568,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           </div>
           <div class="form-group">
             <label>YES Price Low</label>
-            <input type="number" id="bt-yes-low" value="0.60" min="0.01" max="0.99" step="0.01" />
+            <input type="number" id="bt-yes-low" value="0.85" min="0.01" max="0.99" step="0.01" />
           </div>
           <div class="form-group">
             <label>YES Price High</label>
-            <input type="number" id="bt-yes-high" value="0.70" min="0.01" max="0.99" step="0.01" />
+            <input type="number" id="bt-yes-high" value="0.15" min="0.01" max="0.99" step="0.01" />
           </div>
         </div>
         <div class="form-row">
