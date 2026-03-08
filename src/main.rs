@@ -451,6 +451,70 @@ async fn run_scan(
             None
         };
 
+        // Record evaluation and decision in DB
+        {
+            let (pair_label, low_thresh, high_thresh, profit, days) = if !output_pairs.is_empty() {
+                let best = &output_pairs[0];
+                const THOUSAND: f64 = 1000.0;
+                let label = format!(
+                    "BTC ${:.0}k–${:.0}k",
+                    best.low_threshold / THOUSAND,
+                    best.high_threshold / THOUSAND
+                );
+                (label, best.low_threshold, best.high_threshold, best.profit_pct, best.days_until)
+            } else {
+                (String::new(), 0.0, 0.0, 0.0, 0)
+            };
+
+            let (risk_level, confidence, skip, reasoning, factors, low_adj, high_adj) =
+                if let Some(ref ai) = ai_assessment {
+                    (
+                        ai.risk_level.clone(),
+                        ai.confidence,
+                        ai.skip_trade,
+                        ai.reasoning.clone(),
+                        serde_json::to_string(&ai.risk_factors).unwrap_or_else(|_| "[]".to_string()),
+                        ai.suggested_low_adjust_pct,
+                        ai.suggested_high_adjust_pct,
+                    )
+                } else {
+                    ("n/a".to_string(), 0.0, false, String::new(), "[]".to_string(), 0.0, 0.0)
+                };
+
+            let decision = if output_pairs.is_empty() {
+                "no_pairs"
+            } else if skip {
+                "skipped_ai"
+            } else if dry_run {
+                "entered"
+            } else {
+                "scanned"
+            };
+
+            let eval = db::DbEvaluation {
+                id: 0,
+                created_at: Utc::now().to_rfc3339(),
+                btc_price,
+                pair_label,
+                low_threshold: low_thresh,
+                high_threshold: high_thresh,
+                profit_pct: profit,
+                days_until: days,
+                pairs_found: output_pairs.len() as i64,
+                risk_level,
+                confidence,
+                skip_trade: skip,
+                reasoning,
+                risk_factors: factors,
+                suggested_low_adj: low_adj,
+                suggested_high_adj: high_adj,
+                decision: decision.to_string(),
+            };
+            if let Err(e) = database.insert_evaluation(&eval) {
+                warn!("Failed to record evaluation: {e}");
+            }
+        }
+
         // Save portfolio snapshot in dry-run mode
         if dry_run {
             if let Ok(snap) = database.compute_snapshot(btc_price, balance * 10.0) {
